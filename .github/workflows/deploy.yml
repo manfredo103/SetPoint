@@ -1,0 +1,64 @@
+name: Build and Deploy SetPoint
+
+on:
+  push:
+    branches: [main]
+    workflow_dispatch:
+
+      concurrency:
+        group: deploy-setpoint
+      cancel-in-progress: true
+
+    jobs:
+      build-and-deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Checkout Code
+            uses: actions/checkout@v4
+
+          - name: Setup Node.js
+            uses: actions/setup-node@v4
+            with:
+              node-version: 20
+              cache: 'npm'
+
+          - name: Install Dependencies
+            run: npm ci
+
+          - name: Build Svelte / Vite App
+            run: npm run build
+
+          - name: Configure SSH
+            env:
+              SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+              SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+              SSH_HOST: ${{ secrets.SSH_HOST }}
+              SSH_USER: ${{ secrets.SSH_USER }}
+            run: |
+              install -m 700 -d ~/.ssh
+              printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+              chmod 600 ~/.ssh/deploy_key
+              printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+              cat > ~/.ssh/config <<EOF
+              Host atmos-server
+              HostName $SSH_HOST
+              User $SSH_USER
+              IdentityFile ~/.ssh/deploy_key
+              StrictHostKeyChecking yes
+              EOF
+
+              # Upload to a temporary staging folder first, then atomically replace dist
+              # This prevents any user from loading half-uploaded files mid-deploy
+          - name: Atomic Sync to Server
+            run: |
+              ssh atmos-server "mkdir -p /opt/atmos/volleyball/dist_new"
+              scp -r dist/* atmos-server:/opt/atmos/volleyball/dist_new/
+              ssh atmos-server "rm -rf /opt/atmos/volleyball/dist_old && \
+                                mv /opt/atmos/volleyball/dist /opt/atmos/volleyball/dist_old 2>/dev/null || true
+                                && \
+                                mv /opt/atmos/volleyball/dist_new /opt/atmos/volleyball/dist && \
+                                rm -rf /opt/atmos/volleyball/dist_old"
+
+          - name: Clean up SSH key
+            if: always()
+            run: rm -f ~/.ssh/deploy_key
