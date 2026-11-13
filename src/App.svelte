@@ -3,15 +3,33 @@
   import Court from './lib/Court.svelte';
   import MatchHistory from './lib/MatchHistory.svelte';
   import LegalPage from './lib/LegalPage.svelte';
+  import LiveCoachPanel from './lib/LiveCoachPanel.svelte';
+  import BetweenSetModal from './lib/BetweenSetModal.svelte';
   import { generateId, formatEventTime } from './lib/id';
+  import { computeMatchAnalytics } from './lib/analytics';
+  import { buildCoachShareText } from './lib/export';
   import {
+    applyRallyPointState,
+    checkSetWin,
+    checkSubstitutionRule,
+    computeSetsStanding,
+    determineMatchWinner,
+    formatPlayerDisplay,
+    getCurrentPosForIndex,
+    getSetsToWin,
+    getSetTargetPoints,
+    MAX_SUBSTITUTIONS_PER_SET,
+    MAX_TIMEOUTS_PER_SET
+  } from './lib/matchEngine';
+  import {
+    ACTIVE_MATCH_STORAGE_KEY,
     uploadMatch,
     enqueueOfflineMatch,
+    saveMatchToLocalArchive,
     getOfflineOutbox,
     getStoredApiKey,
     setStoredApiKey,
-    ApiUnauthorizedError,
-    ApiNetworkError
+    ApiUnauthorizedError
   } from './lib/api';
   import type {
     PlayerSelection,
@@ -19,6 +37,9 @@
     EventCategory,
     EventQuality,
     MatchSetup,
+    MatchFormat,
+    MatchUndoSnapshot,
+    SubstitutionPair,
     FormationMode,
     PlayerSetup,
     BenchPlayer,
@@ -29,8 +50,6 @@
     LegalTab
   } from './lib/types';
 
-  const ACTIVE_MATCH_STORAGE_KEY = 'setpoint_active_match';
-
   interface ActiveMatchSnapshot {
     step: 'setup' | 'tracker' | 'history' | 'legal';
     returnStepFromHistory: 'setup' | 'tracker';
@@ -38,21 +57,32 @@
     matchData: MatchSetup;
     matchId: string;
     matchStartedAt: string;
+    matchFormat?: MatchFormat;
     myScore: number;
     opponentScore: number;
     servingTeam: 'us' | 'them';
+    setInitialServe?: 'us' | 'them';
     completedSets: CompletedSet[];
     currentRotation: RotationPosition;
+    opponentRotation?: RotationPosition;
     formationMode: FormationMode;
     courtPlayers: PlayerSetup[];
+    startingSixSnapshot?: PlayerSetup[];
     benchPlayers: BenchPlayer[];
     activeLiberoId: string | null;
     liberoAutoSwap: boolean;
+    liberoCanServe?: boolean;
     substitutionCount: number;
+    subPairs?: SubstitutionPair[];
+    timeoutsUs?: number;
+    timeoutsThem?: number;
     events: VolleyballEvent[];
     opponentLineup: string[];
+    setEndedManually?: boolean;
     matchEndedManually: boolean;
     continuePast25: boolean;
+    autoClearAfterPoint?: boolean;
+    courtFlipped?: boolean;
     saveStatus: 'idle' | 'saving' | 'saved' | 'queued' | 'error';
     saveMessage: string | null;
   }
@@ -130,29 +160,46 @@
 
   // Live Match Roster & Substitution States
   let courtPlayers = $state<PlayerSetup[]>(initialSavedMatch?.courtPlayers ?? []);
+  let startingSixSnapshot = $state<PlayerSetup[]>(
+    initialSavedMatch?.startingSixSnapshot ?? initialSavedMatch?.courtPlayers ?? []
+  );
   let benchPlayers = $state<BenchPlayer[]>(initialSavedMatch?.benchPlayers ?? []);
   let activeLiberoId = $state<string | null>(initialSavedMatch?.activeLiberoId ?? null);
   let liberoAutoSwap = $state(initialSavedMatch?.liberoAutoSwap ?? true);
+  let liberoCanServe = $state(initialSavedMatch?.liberoCanServe ?? false);
   let substitutionCount = $state(initialSavedMatch?.substitutionCount ?? 0);
+  let subPairs = $state<SubstitutionPair[]>(initialSavedMatch?.subPairs ?? []);
+  let subWarning = $state<string | null>(null);
   let showSubPanel = $state(false);
   let subOutIndex = $state<number | null>(null);
   let subInBenchId = $state<string | null>(null);
 
-  // Smart Scoreboard & Serve States (Svelte 5)
+  // Smart Scoreboard, Serve, Timeouts & Ergonomics States
   let myScore = $state(initialSavedMatch?.myScore ?? 0);
   let opponentScore = $state(initialSavedMatch?.opponentScore ?? 0);
   let servingTeam = $state<'us' | 'them'>(initialSavedMatch?.servingTeam ?? 'us');
+  let setInitialServe = $state<'us' | 'them'>(
+    initialSavedMatch?.setInitialServe ?? initialSavedMatch?.matchData?.initialServe ?? 'us'
+  );
+  let timeoutsUs = $state(initialSavedMatch?.timeoutsUs ?? 0);
+  let timeoutsThem = $state(initialSavedMatch?.timeoutsThem ?? 0);
 
-  // Match-End & Multi-Set States (Regelwerk: ≥25 Punkte mit ≥2 Punkten Vorsprung + manuelles Spielende)
-  const RULEBOOK_TARGET_POINTS = 25;
-  const RULEBOOK_MIN_LEAD = 2;
+  // Set/Match End & Format States
+  let setEndedManually = $state(initialSavedMatch?.setEndedManually ?? false);
   let matchEndedManually = $state(initialSavedMatch?.matchEndedManually ?? false);
-  let continuePast25 = $state(initialSavedMatch?.continuePast25 ?? false);
+  let continuePastTarget = $state(initialSavedMatch?.continuePast25 ?? false);
   let completedSets = $state<CompletedSet[]>(initialSavedMatch?.completedSets ?? []);
+  let showBetweenSetModal = $state(false);
+  let copyShareFeedback = $state<string | null>(null);
 
-  // Svelte 5 Runes State
+  // Rotation, Court & Scouting Ergonomics
   let currentRotation = $state<number>(initialSavedMatch?.currentRotation ?? 1);
+  let opponentRotation = $state<number>(initialSavedMatch?.opponentRotation ?? 1);
   let formationMode = $state<FormationMode>(initialSavedMatch?.formationMode ?? 'base');
+  let courtFlipped = $state(initialSavedMatch?.courtFlipped ?? false);
+  let autoClearAfterPoint = $state(initialSavedMatch?.autoClearAfterPoint ?? true);
+  let wakeLockEnabled = $state(true);
+  let wakeLockActive = $state(false);
   let selectedPlayer = $state<PlayerSelection | null>(null);
   let events = $state<VolleyballEvent[]>(initialSavedMatch?.events ?? []);
   let opponentLineup = $state<string[]>(initialSavedMatch?.opponentLineup ?? ["#1", "#2", "#3", "#4", "#5", "#6"]);
@@ -170,21 +217,32 @@
       matchData,
       matchId,
       matchStartedAt,
+      matchFormat: matchData.matchFormat ?? 'bo5',
       myScore,
       opponentScore,
       servingTeam,
+      setInitialServe,
       completedSets,
       currentRotation: currentRotation as RotationPosition,
+      opponentRotation: opponentRotation as RotationPosition,
       formationMode,
       courtPlayers,
+      startingSixSnapshot,
       benchPlayers,
       activeLiberoId,
       liberoAutoSwap,
+      liberoCanServe,
       substitutionCount,
+      subPairs,
+      timeoutsUs,
+      timeoutsThem,
       events,
       opponentLineup,
+      setEndedManually,
       matchEndedManually,
-      continuePast25,
+      continuePast25: continuePastTarget,
+      autoClearAfterPoint,
+      courtFlipped,
       saveStatus,
       saveMessage
     };
@@ -207,7 +265,6 @@
 
   // Automatisches Speichern bei jeder Zustandsänderung während eines aktiven Spiels
   $effect(() => {
-    // Reaktivität auf relevante Variablen registrieren
     const _track = [
       step,
       returnStepFromHistory,
@@ -215,23 +272,76 @@
       myScore,
       opponentScore,
       servingTeam,
+      setInitialServe,
       currentRotation,
+      opponentRotation,
       formationMode,
       substitutionCount,
+      subPairs,
+      timeoutsUs,
+      timeoutsThem,
       activeLiberoId,
       liberoAutoSwap,
+      liberoCanServe,
+      setEndedManually,
       matchEndedManually,
-      continuePast25,
+      continuePastTarget,
+      autoClearAfterPoint,
+      courtFlipped,
       saveStatus,
       saveMessage,
       completedSets,
       events,
       courtPlayers,
-      benchPlayers
+      benchPlayers,
+      opponentLineup
     ];
     if (matchData) {
       persistActiveMatch();
     }
+  });
+
+  // Screen Wake Lock für die Bank (Display bleibt im Live-Tracker aktiv)
+  $effect(() => {
+    if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
+    if (step !== 'tracker' || !wakeLockEnabled) {
+      wakeLockActive = false;
+      return;
+    }
+
+    const nav = navigator as Navigator & {
+      wakeLock?: { request: (type: 'screen') => Promise<{ release: () => Promise<void> }> };
+    };
+    if (!nav.wakeLock) return;
+
+    let sentinel: { release: () => Promise<void> } | null = null;
+    let disposed = false;
+
+    const acquire = async () => {
+      if (disposed || document.visibilityState !== 'visible') return;
+      try {
+        sentinel = await nav.wakeLock!.request('screen');
+        wakeLockActive = !disposed;
+      } catch {
+        wakeLockActive = false;
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        acquire();
+      }
+    };
+
+    acquire();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      disposed = true;
+      wakeLockActive = false;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      sentinel?.release().catch(() => {});
+    };
   });
 
   // Schutz vor versehentlichem Neuladen / Verlassen der Seite bei laufendem Spiel
@@ -247,12 +357,6 @@
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   });
 
-  function checkRulebookWin(us: number, them: number): 'us' | 'them' | null {
-    if (us >= RULEBOOK_TARGET_POINTS && us - them >= RULEBOOK_MIN_LEAD) return 'us';
-    if (them >= RULEBOOK_TARGET_POINTS && them - us >= RULEBOOK_MIN_LEAD) return 'them';
-    return null;
-  }
-
   // Derived Libero & Bench lists
   const registeredLiberos = $derived(benchPlayers.filter((b) => b.isLibero));
   const regularBenchPlayers = $derived(benchPlayers.filter((b) => !b.isLibero));
@@ -260,17 +364,25 @@
     registeredLiberos.find((l) => l.id === activeLiberoId) ?? registeredLiberos[0] ?? null
   );
   const effectiveLiberoName = $derived(
-    liberoAutoSwap && activeLibero ? activeLibero.name : null
+    liberoAutoSwap && activeLibero
+      ? activeLibero.number
+        ? `#${activeLibero.number} ${activeLibero.name}`
+        : activeLibero.name
+      : null
   );
-  const canUndoScoreAction = $derived(
-    events.length > 0 && Boolean(events[0]?.scoreSnapshot)
+  const canUndoAction = $derived(
+    events.length > 0 && Boolean(events[0]?.undoSnapshot || events[0]?.scoreSnapshot)
   );
 
-  // Automatische Spielende-Erkennung (≥25 Punkte & ≥2 Vorsprung) + Manuelles Ende (z.B. 5. Satz)
-  const rulebookWinner = $derived(checkRulebookWin(myScore, opponentScore));
-  const isRulebookMatchOver = $derived(rulebookWinner !== null && !continuePast25);
-  const isMatchOver = $derived(isRulebookMatchOver || matchEndedManually);
+  // Satz- & Spielende-Erkennung nach offiziellem Regelwerk (25 Pkt / Satz 5 bzw. Bo3-Satz 3 bis 15 Pkt + 2 Vorsprung)
+  const matchFormat = $derived<MatchFormat>(matchData?.matchFormat ?? 'bo5');
   const currentSetNumber = $derived(completedSets.length + 1);
+  const currentSetTarget = $derived(getSetTargetPoints(currentSetNumber, matchFormat));
+  const setsToWinMatch = $derived(getSetsToWin(matchFormat));
+
+  const rulebookSetWinner = $derived(checkSetWin(myScore, opponentScore, currentSetTarget));
+  const isRulebookSetOver = $derived(rulebookSetWinner !== null && !continuePastTarget);
+  const isSetOver = $derived(isRulebookSetOver || setEndedManually);
 
   const allMatchSets = $derived.by<CompletedSet[]>(() => {
     if (myScore > 0 || opponentScore > 0 || completedSets.length === 0) {
@@ -279,68 +391,44 @@
     return [...completedSets];
   });
 
-  const setsStanding = $derived.by(() => {
-    let us = 0;
-    let them = 0;
-    for (const s of allMatchSets) {
-      if (s.myScore > s.opponentScore) us++;
-      else if (s.opponentScore > s.myScore) them++;
-    }
-    return { us, them };
-  });
+  const setsStanding = $derived(computeSetsStanding(allMatchSets));
+
+  const isMatchDecidedBySets = $derived(
+    setsToWinMatch !== null &&
+      isSetOver &&
+      (setsStanding.us >= setsToWinMatch || setsStanding.them >= setsToWinMatch)
+  );
+  const isMatchOver = $derived(matchEndedManually || isMatchDecidedBySets);
+  const isPlayLocked = $derived(isSetOver || isMatchOver);
 
   const matchWinner = $derived.by<MatchWinner | null>(() => {
-    if (!isMatchOver) return null;
-    if (allMatchSets.length > 1) {
-      if (setsStanding.us > setsStanding.them) return 'us';
-      if (setsStanding.them > setsStanding.us) return 'them';
-    }
-    if (myScore > opponentScore) return 'us';
-    if (opponentScore > myScore) return 'them';
-    return 'tie';
+    if (!isMatchOver && !isSetOver) return null;
+    return determineMatchWinner(allMatchSets, myScore, opponentScore);
   });
 
-  // Live-Hinweis bei Satz-/Matchball oder Verlängerung (24:24+)
+  // Live-Hinweis bei Satz-/Matchball oder Verlängerung (ab target - 1)
   const crunchTimeHint = $derived.by<string | null>(() => {
-    if (isMatchOver || continuePast25) return null;
-    if (myScore >= 24 && opponentScore >= 24 && myScore === opponentScore) {
+    if (isPlayLocked || continuePastTarget) return null;
+    const deciderThreshold = currentSetTarget - 1;
+    if (myScore >= deciderThreshold && opponentScore >= deciderThreshold && myScore === opponentScore) {
       return `Verlängerung (${myScore}:${opponentScore}) • +2 Vorsprung nötig`;
     }
-    if (myScore >= 24 && myScore - opponentScore === 1) {
-      return `Match-/Satzball ${matchData?.teamName ?? 'Wir'}!`;
+    if (myScore >= deciderThreshold && myScore - opponentScore >= 1) {
+      return `Satzball ${matchData?.teamName ?? 'Wir'}!`;
     }
-    if (opponentScore >= 24 && opponentScore - myScore === 1) {
-      return `Match-/Satzball ${matchData?.opponentName ?? 'Gegner'}`;
+    if (opponentScore >= deciderThreshold && opponentScore - myScore >= 1) {
+      return `Satzball ${matchData?.opponentName ?? 'Gegner'}`;
     }
     return null;
   });
 
-  // Kompakte Post-Match-Statistiken für die Spielende-Übersicht
-  const matchSummaryStats = $derived.by(() => {
-    let aces = 0;
-    let kills = 0;
-    let blocks = 0;
-    let passSum = 0;
-    let passCount = 0;
-
-    for (const ev of events) {
-      if (ev.actionId === 'ace') aces++;
-      if (ev.actionId === 'kill' || ev.actionId === 'tip_kill') kills++;
-      if (ev.actionId === 'block') blocks++;
-      if (ev.passRating !== undefined) {
-        passSum += ev.passRating;
-        passCount++;
-      }
-    }
-
-    return {
-      aces,
-      kills,
-      blocks,
-      passAvg: passCount > 0 ? (passSum / passCount).toFixed(2) : '–',
-      passCount
-    };
-  });
+  // Einheitliche Analytics für Spielende-Übersicht
+  const matchAnalytics = $derived(
+    computeMatchAnalytics(events, {
+      setFilter: 'all',
+      initialServe: matchData?.initialServe ?? 'us'
+    })
+  );
 
   function handleStartMatch(data: MatchSetup) {
     matchData = data;
@@ -348,32 +436,46 @@
     matchStartedAt = new Date().toISOString();
     saveStatus = 'idle';
     saveMessage = null;
+    copyShareFeedback = null;
     showApiPinPrompt = false;
     outboxCount = getOfflineOutbox().length;
     myScore = 0;
     opponentScore = 0;
     servingTeam = data.initialServe ?? 'us';
+    setInitialServe = data.initialServe ?? 'us';
+    timeoutsUs = 0;
+    timeoutsThem = 0;
+    setEndedManually = false;
     matchEndedManually = false;
-    continuePast25 = false;
+    continuePastTarget = false;
     completedSets = [];
-    currentRotation = 1;
+    currentRotation = data.startingRotation ?? 1;
+    opponentRotation = 1;
+    opponentLineup = data.opponentLineup ? [...data.opponentLineup] : ['#1', '#2', '#3', '#4', '#5', '#6'];
     events = [];
     selectedPlayer = null;
     substitutionCount = 0;
+    subPairs = [];
+    subWarning = null;
     subOutIndex = null;
     subInBenchId = null;
 
-    courtPlayers = (data.players ?? []).map((p, idx) => ({
+    const initialStarters = (data.players ?? []).map((p, idx) => ({
       id: p.id ?? `starter-${idx + 1}`,
       position: (idx + 1) as RotationPosition,
+      number: p.number,
       name: p.name,
       role: p.role
     }));
+    courtPlayers = initialStarters;
+    startingSixSnapshot = initialStarters.map((p) => ({ ...p }));
 
     benchPlayers = (data.bench ?? []).map((b) => ({ ...b }));
     const firstLibero = benchPlayers.find((b) => b.isLibero);
     activeLiberoId = firstLibero ? firstLibero.id : null;
     liberoAutoSwap = Boolean(firstLibero);
+    liberoCanServe = false;
+    courtFlipped = false;
 
     step = 'tracker';
     restoredMatchNotice = false;
@@ -394,12 +496,16 @@
       teamName: matchData?.teamName ?? 'Mein Team',
       opponentName: matchData?.opponentName ?? 'Gegner',
       system: matchData?.system ?? '5-1',
+      matchFormat,
       initialServe: matchData?.initialServe,
       winner: matchWinner ?? 'tie',
-      endReason: isRulebookMatchOver ? 'rulebook' : 'manual',
+      endReason: isRulebookSetOver && !matchEndedManually ? 'rulebook' : 'manual',
       sets: allMatchSets,
-      players: courtPlayers,
+      players: startingSixSnapshot.length === 6 ? startingSixSnapshot : courtPlayers,
       bench: benchPlayers,
+      opponentLineup,
+      timeoutsUs,
+      timeoutsThem,
       events
     };
   }
@@ -419,22 +525,33 @@
       saveStatus = 'saved';
       showApiPinPrompt = false;
       outboxCount = getOfflineOutbox().length;
-      saveMessage = `Spiel (${allMatchSets.length} ${allMatchSets.length === 1 ? 'Satz' : 'Sätze'}, ${res.syncedEvents} Events) in InfluxDB gespeichert!`;
+      saveMessage = `Spiel (${allMatchSets.length} ${allMatchSets.length === 1 ? 'Satz' : 'Sätze'}, ${res.syncedEvents} Events) in InfluxDB & lokal gespeichert!`;
     } catch (err) {
       if (err instanceof ApiUnauthorizedError) {
+        saveMatchToLocalArchive({ ...payload, syncState: 'local' });
         saveStatus = 'error';
         showApiPinPrompt = true;
-        saveMessage = 'Team-PIN (VOLLEYBALL_API_KEY) erforderlich oder ungültig.';
-      } else if (err instanceof ApiNetworkError) {
+        saveMessage = 'Lokal gesichert, aber Team-PIN für Server-Upload ungültig/erforderlich.';
+      } else {
         enqueueOfflineMatch(payload);
         outboxCount = getOfflineOutbox().length;
         saveStatus = 'queued';
-        saveMessage = 'Keine Server-Verbindung: Spiel wurde lokal gesichert und kann später unter „Gespeicherte Spiele“ hochgeladen werden.';
-      } else {
-        saveStatus = 'error';
-        saveMessage = err instanceof Error ? err.message : 'Fehler beim Speichern.';
+        saveMessage =
+          'Offline / ohne Server: Spiel sicher auf diesem Gerät im Archiv gespeichert.';
       }
     }
+  }
+
+  async function handleShareQuickSummary() {
+    if (!matchData) return;
+    const text = buildCoachShareText(buildMatchPayload());
+    try {
+      await navigator.clipboard.writeText(text);
+      copyShareFeedback = 'WhatsApp-Summary kopiert!';
+    } catch {
+      copyShareFeedback = 'Kopieren nicht möglich — Archiv → Export nutzen.';
+    }
+    setTimeout(() => (copyShareFeedback = null), 3000);
   }
 
   function handleReset() {
@@ -443,6 +560,7 @@
       step = 'setup';
       matchData = null;
       courtPlayers = [];
+      startingSixSnapshot = [];
       benchPlayers = [];
       activeLiberoId = null;
       events = [];
@@ -450,19 +568,20 @@
       myScore = 0;
       opponentScore = 0;
       currentRotation = 1;
+      opponentRotation = 1;
+      timeoutsUs = 0;
+      timeoutsThem = 0;
       substitutionCount = 0;
+      subPairs = [];
+      subWarning = null;
+      setEndedManually = false;
       matchEndedManually = false;
-      continuePast25 = false;
+      continuePastTarget = false;
       saveStatus = 'idle';
       saveMessage = null;
+      copyShareFeedback = null;
       restoredMatchNotice = false;
     }
-  }
-
-  // Aktuelle Feldposition (1–6) eines Spielers anhand seines Lineup-Index (0–5) berechnen:
-  // Da playerIndex = (pos - currentRotation + 6) % 6 gilt, ist pos = ((playerIndex + currentRotation - 1) % 6) + 1
-  function getCurrentPosForIndex(playerIndex: number, rot: number): RotationPosition {
-    return (((playerIndex + rot - 1) % 6) + 1) as RotationPosition;
   }
 
   function getCourtPlayerLabelAtPos(pos: RotationPosition, rot: number) {
@@ -470,27 +589,33 @@
     const item = courtPlayers[playerIndex];
     const roleStr = (item?.role ?? '').toUpperCase();
     let player = item?.name
-      ? item.role
-        ? `${item.name} (${item.role})`
-        : item.name
+      ? formatPlayerDisplay(item)
       : `#${playerIndex + 1}`;
+    let playerNum = item?.number?.trim() || undefined;
 
     const isBackRow = pos === 1 || pos === 5 || pos === 6;
+    const liberoAllowedOnPos = isBackRow && (pos !== 1 || servingTeam === 'them' || liberoCanServe);
     const isMB = roleStr === 'MB1' || roleStr === 'MB2';
-    if (isBackRow && isMB && effectiveLiberoName) {
-      player = `${effectiveLiberoName} (L)`;
+    if (liberoAllowedOnPos && isMB && activeLibero) {
+      player = formatPlayerDisplay({
+        name: activeLibero.name,
+        number: activeLibero.number,
+        role: 'L'
+      });
+      playerNum = activeLibero.number?.trim() || undefined;
     }
 
-    return { player, playerIndex };
+    return { player, playerNum, playerIndex };
   }
 
   function syncSelectionState(rot: number = currentRotation) {
     if (!selectedPlayer) return;
     if (selectedPlayer.team === 'myTeam') {
-      const { player, playerIndex } = getCourtPlayerLabelAtPos(selectedPlayer.position, rot);
+      const { player, playerNum, playerIndex } = getCourtPlayerLabelAtPos(selectedPlayer.position, rot);
       selectedPlayer = {
         ...selectedPlayer,
         player,
+        playerNum,
         playerIndex,
         rotation: rot,
         isServer: selectedPlayer.position === 1 && servingTeam === 'us'
@@ -504,29 +629,71 @@
     }
   }
 
-  // Zentrale Side-out & Punkt-Logik nach offiziellen Volleyball-Regeln
-  function addPoint(winningTeam: 'us' | 'them') {
-    if (winningTeam === 'us') {
-      myScore++;
-      if (servingTeam === 'them') {
-        // Side-out gewonnen! Aufschlagrecht wechselt zu uns + wir rotieren im Uhrzeigersinn (Läufer zählt herunter: 1 -> 6 -> ... -> 1)
-        servingTeam = 'us';
-        const nextRot = currentRotation === 1 ? 6 : currentRotation - 1;
-        currentRotation = nextRot;
-        syncSelectionState(nextRot);
-      }
-    } else {
-      opponentScore++;
-      if (servingTeam === 'us') {
-        // Side-out für den Gegner! Aufschlagrecht wechselt, wir rotieren NICHT
-        servingTeam = 'them';
-        syncSelectionState(currentRotation);
-      }
-    }
+  function createUndoSnapshot(): MatchUndoSnapshot {
+    return {
+      myScore,
+      opponentScore,
+      servingTeam,
+      rotation: currentRotation as RotationPosition,
+      opponentRotation: opponentRotation as RotationPosition,
+      courtPlayers: courtPlayers.map((p) => ({ ...p })),
+      benchPlayers: benchPlayers.map((b) => ({ ...b })),
+      substitutionCount,
+      subPairs: subPairs.map((sp) => ({ ...sp })),
+      activeLiberoId,
+      liberoAutoSwap,
+      timeoutsUs,
+      timeoutsThem,
+      setEndedManually,
+      matchEndedManually,
+      continuePastTarget
+    };
+  }
+
+  function restoreUndoSnapshot(snap: MatchUndoSnapshot) {
+    myScore = snap.myScore;
+    opponentScore = snap.opponentScore;
+    servingTeam = snap.servingTeam;
+    currentRotation = snap.rotation;
+    opponentRotation = snap.opponentRotation;
+    courtPlayers = snap.courtPlayers.map((p) => ({ ...p }));
+    benchPlayers = snap.benchPlayers.map((b) => ({ ...b }));
+    substitutionCount = snap.substitutionCount;
+    subPairs = snap.subPairs.map((sp) => ({ ...sp }));
+    activeLiberoId = snap.activeLiberoId;
+    liberoAutoSwap = snap.liberoAutoSwap;
+    timeoutsUs = snap.timeoutsUs;
+    timeoutsThem = snap.timeoutsThem;
+    setEndedManually = snap.setEndedManually;
+    matchEndedManually = snap.matchEndedManually;
+    continuePastTarget = snap.continuePastTarget;
+    subWarning = null;
+    syncSelectionState(snap.rotation);
+  }
+
+  // Zentrale Side-out & Punkt-Logik für beide Teams
+  function addPoint(winningTeam: 'us' | 'them'): boolean {
+    const next = applyRallyPointState(
+      {
+        myScore,
+        opponentScore,
+        servingTeam,
+        currentRotation: currentRotation as RotationPosition,
+        opponentRotation: opponentRotation as RotationPosition
+      },
+      winningTeam
+    );
+    myScore = next.myScore;
+    opponentScore = next.opponentScore;
+    servingTeam = next.servingTeam;
+    currentRotation = next.currentRotation;
+    opponentRotation = next.opponentRotation;
+    syncSelectionState(next.currentRotation);
+    return next.didSideout;
   }
 
   function setServingTeamManual(team: 'us' | 'them') {
-    if (isMatchOver || servingTeam === team) return;
+    if (isPlayLocked || servingTeam === team) return;
     servingTeam = team;
     syncSelectionState(currentRotation);
   }
@@ -537,27 +704,21 @@
     } else {
       opponentScore = Math.max(0, opponentScore + delta);
     }
-    if (checkRulebookWin(myScore, opponentScore) === null) {
-      continuePast25 = false;
+    if (checkSetWin(myScore, opponentScore, currentSetTarget) === null) {
+      continuePastTarget = false;
     }
   }
 
   function logManualPoint(winningTeam: 'us' | 'them') {
-    if (isMatchOver) return;
+    if (isPlayLocked) return;
     const id = generateId('pt');
     const timestamp = formatEventTime();
-    const snapshot = {
-      myScore,
-      opponentScore,
-      servingTeam,
-      rotation: currentRotation as RotationPosition
-    };
+    const undoSnap = createUndoSnapshot();
     const eventRotation = currentRotation as RotationPosition;
     const prevServe = servingTeam;
 
-    addPoint(winningTeam);
-    const didSideout = prevServe !== servingTeam;
-    const reachedRulebookEnd = !continuePast25 && checkRulebookWin(myScore, opponentScore) !== null;
+    const didSideout = addPoint(winningTeam);
+    const reachedRulebookEnd = !continuePastTarget && checkSetWin(myScore, opponentScore, currentSetTarget) !== null;
     const teamLabel =
       winningTeam === 'us'
         ? matchData?.teamName ?? 'Mein Team'
@@ -573,49 +734,112 @@
       action: `Punkt ${teamLabel}`,
       rotation: eventRotation,
       team: winningTeam === 'us' ? 'myTeam' : 'opponent',
+      wasServing: prevServe,
       scoreAfter: `${myScore}:${opponentScore}`,
       isSideout: didSideout || undefined,
       isMatchEnd: reachedRulebookEnd || undefined,
-      scoreSnapshot: snapshot
+      undoSnapshot: undoSnap
     };
 
     saveStatus = 'idle';
     events = [newEvent, ...events];
+    if (autoClearAfterPoint) {
+      selectedPlayer = null;
+      subOutIndex = null;
+    }
   }
 
   function undoLastEvent() {
-    if (!canUndoScoreAction) return;
+    if (!canUndoAction) return;
     const [latest, ...rest] = events;
-    if (latest.actionId === 'manual_end') {
-      matchEndedManually = false;
-    }
-    if (latest.scoreSnapshot) {
+    if (latest.undoSnapshot) {
+      restoreUndoSnapshot(latest.undoSnapshot);
+    } else if (latest.scoreSnapshot) {
+      if (latest.actionId === 'manual_end') {
+        matchEndedManually = false;
+      }
       myScore = latest.scoreSnapshot.myScore;
       opponentScore = latest.scoreSnapshot.opponentScore;
       servingTeam = latest.scoreSnapshot.servingTeam;
       currentRotation = latest.scoreSnapshot.rotation;
       syncSelectionState(latest.scoreSnapshot.rotation);
     }
-    if (checkRulebookWin(myScore, opponentScore) === null) {
-      continuePast25 = false;
+    if (checkSetWin(myScore, opponentScore, currentSetTarget) === null) {
+      continuePastTarget = false;
     }
     saveStatus = 'idle';
     saveMessage = null;
     events = rest;
   }
 
-  function handleManualEndMatch() {
+  function callTimeout(team: 'us' | 'them') {
+    if (isPlayLocked) return;
+    if (team === 'us' && timeoutsUs >= MAX_TIMEOUTS_PER_SET) return;
+    if (team === 'them' && timeoutsThem >= MAX_TIMEOUTS_PER_SET) return;
+
+    const undoSnap = createUndoSnapshot();
+    if (team === 'us') {
+      timeoutsUs += 1;
+    } else {
+      timeoutsThem += 1;
+    }
+
+    const label =
+      team === 'us'
+        ? `Auszeit ${matchData?.teamName ?? 'Mein Team'} (${timeoutsUs}/${MAX_TIMEOUTS_PER_SET})`
+        : `Auszeit ${matchData?.opponentName ?? 'Gegner'} (${timeoutsThem}/${MAX_TIMEOUTS_PER_SET})`;
+
+    events = [
+      {
+        id: generateId('to'),
+        timestamp: formatEventTime(),
+        isoTimestamp: new Date().toISOString(),
+        setNumber: currentSetNumber,
+        category: 'timeout',
+        quality: 'neutral',
+        action: label,
+        rotation: currentRotation as RotationPosition,
+        team: team === 'us' ? 'myTeam' : 'opponent',
+        wasServing: servingTeam,
+        scoreAfter: `${myScore}:${opponentScore}`,
+        undoSnapshot: undoSnap
+      },
+      ...events
+    ];
+  }
+
+  function addQuickNote(noteText: string) {
+    const trimmed = noteText.trim();
+    if (!trimmed) return;
+    const undoSnap = createUndoSnapshot();
+    events = [
+      {
+        id: generateId('note'),
+        timestamp: formatEventTime(),
+        isoTimestamp: new Date().toISOString(),
+        setNumber: currentSetNumber,
+        category: 'note',
+        quality: 'neutral',
+        action: `Notiz: ${trimmed}`,
+        note: trimmed,
+        rotation: currentRotation as RotationPosition,
+        wasServing: servingTeam,
+        undoSnapshot: undoSnap
+      },
+      ...events
+    ];
+  }
+
+  function handleManualEndMatch(skipConfirm = false) {
     if (isMatchOver) return;
-    if (!confirm(`Spiel beim Stand von ${myScore}:${opponentScore} jetzt beenden (z.B. 5. Satz / vorzeitiges Spielende)?`)) {
+    if (
+      !skipConfirm &&
+      !confirm(`Spiel beim Stand von ${myScore}:${opponentScore} komplett beenden und zum Speichern freigeben?`)
+    ) {
       return;
     }
 
-    const snapshot = {
-      myScore,
-      opponentScore,
-      servingTeam,
-      rotation: currentRotation as RotationPosition
-    };
+    const undoSnap = createUndoSnapshot();
     matchEndedManually = true;
     saveStatus = 'idle';
     saveMessage = null;
@@ -641,7 +865,7 @@
       rotation: currentRotation as RotationPosition,
       scoreAfter: `${myScore}:${opponentScore}`,
       isMatchEnd: true,
-      scoreSnapshot: snapshot
+      undoSnapshot: undoSnap
     };
 
     events = [endEvent, ...events];
@@ -654,14 +878,46 @@
         events = events.slice(1);
       }
     }
-    if (checkRulebookWin(myScore, opponentScore) !== null) {
-      continuePast25 = true;
+    setEndedManually = false;
+    if (checkSetWin(myScore, opponentScore, currentSetTarget) !== null) {
+      continuePastTarget = true;
     }
     saveStatus = 'idle';
     saveMessage = null;
   }
 
-  function startNewSetInternal() {
+  function restoreStartingSixToCourt() {
+    if (startingSixSnapshot.length !== 6) return;
+    const starterIds = new Set(startingSixSnapshot.map((s) => s.id).filter(Boolean));
+    const currentPool: BenchPlayer[] = [];
+    for (const cp of courtPlayers) {
+      if (cp.id && !starterIds.has(cp.id)) {
+        currentPool.push({
+          id: cp.id,
+          number: cp.number,
+          name: cp.name,
+          role: cp.role,
+          isLibero: false
+        });
+      }
+    }
+    for (const bp of benchPlayers) {
+      if (bp.isLibero || !starterIds.has(bp.id)) {
+        currentPool.push({ ...bp });
+      }
+    }
+    courtPlayers = startingSixSnapshot.map((s) => ({ ...s }));
+    benchPlayers = currentPool;
+  }
+
+  function confirmStartNewSet(opts: {
+    startingRotation: RotationPosition;
+    opponentRotation: RotationPosition;
+    servingTeam: 'us' | 'them';
+    restoreStartingLineup: boolean;
+    flipCourt: boolean;
+  }) {
+    showBetweenSetModal = false;
     if (myScore > 0 || opponentScore > 0) {
       completedSets = [
         ...completedSets,
@@ -670,14 +926,31 @@
     }
     myScore = 0;
     opponentScore = 0;
+    timeoutsUs = 0;
+    timeoutsThem = 0;
+    setEndedManually = false;
     matchEndedManually = false;
-    continuePast25 = false;
+    continuePastTarget = false;
     saveStatus = 'idle';
     saveMessage = null;
-    currentRotation = 1;
     substitutionCount = 0;
-    servingTeam = servingTeam === 'us' ? 'them' : 'us';
-    syncSelectionState(1);
+    subPairs = [];
+    subWarning = null;
+    subOutIndex = null;
+    subInBenchId = null;
+
+    if (opts.restoreStartingLineup) {
+      restoreStartingSixToCourt();
+    }
+    if (opts.flipCourt) {
+      courtFlipped = !courtFlipped;
+    }
+
+    currentRotation = opts.startingRotation;
+    opponentRotation = opts.opponentRotation;
+    servingTeam = opts.servingTeam;
+    setInitialServe = opts.servingTeam;
+    syncSelectionState(opts.startingRotation);
 
     const nextSetNum = completedSets.length + 1;
     events = [
@@ -688,25 +961,19 @@
         setNumber: nextSetNum,
         category: 'note',
         quality: 'neutral',
-        action: `Satz ${nextSetNum} gestartet (0:0)`,
-        rotation: 1
+        action: `Satz ${nextSetNum} gestartet (0:0 • R${opts.startingRotation})`,
+        rotation: opts.startingRotation
       },
       ...events
     ];
   }
 
   function handleNewSet() {
-    if (isMatchOver) {
-      startNewSetInternal();
-      return;
-    }
-    if (confirm("Neuen Satz starten? Spielstand (0:0), Rotation (R1) und Wechselzähler (0/6) werden zurückgesetzt.")) {
-      startNewSetInternal();
-    }
+    showBetweenSetModal = true;
   }
 
   function performSubstitution() {
-    if (isMatchOver || subOutIndex === null || !subInBenchId) return;
+    if (isPlayLocked || subOutIndex === null || !subInBenchId) return;
     const outgoing = courtPlayers[subOutIndex];
     const incomingBenchIdx = benchPlayers.findIndex(
       (b) => b.id === subInBenchId && !b.isLibero
@@ -714,20 +981,32 @@
     if (!outgoing || incomingBenchIdx === -1) return;
 
     const incoming = benchPlayers[incomingBenchIdx];
+    const ruleCheck = checkSubstitutionRule({
+      outgoing,
+      incoming,
+      substitutionCount,
+      subPairs,
+      courtPlayers,
+      benchPlayers
+    });
+    subWarning = ruleCheck.warning ?? null;
+
+    const undoSnap = createUndoSnapshot();
     const currentPos = getCurrentPosForIndex(subOutIndex, currentRotation);
     const row: 'front' | 'back' =
       currentPos === 2 || currentPos === 3 || currentPos === 4 ? 'front' : 'back';
 
-    // Swap players between court and bench
     courtPlayers[subOutIndex] = {
       id: incoming.id,
       position: outgoing.position,
+      number: incoming.number,
       name: incoming.name,
       role: incoming.role
     };
 
     benchPlayers[incomingBenchIdx] = {
       id: outgoing.id ?? generateId('player'),
+      number: outgoing.number,
       name: outgoing.name,
       role: outgoing.role,
       isLibero: false
@@ -735,15 +1014,28 @@
 
     substitutionCount += 1;
 
-    // Falls der ausgewechselte Spieler gerade ausgewählt war, Auswahl aktualisieren
+    // Record FIVB pair if neither id is already paired
+    const outId = outgoing.id ?? '';
+    const inId = incoming.id;
+    const alreadyPaired = subPairs.some(
+      (p) =>
+        p.starterId === outId ||
+        p.subId === outId ||
+        p.starterId === inId ||
+        p.subId === inId
+    );
+    if (!alreadyPaired && outId && inId) {
+      subPairs = [...subPairs, { starterId: outId, subId: inId }];
+    }
+
     if (selectedPlayer && selectedPlayer.team === 'myTeam' && selectedPlayer.playerIndex === subOutIndex) {
       selectedPlayer = {
         ...selectedPlayer,
-        player: `${incoming.name} (${incoming.role})`
+        player: formatPlayerDisplay(incoming),
+        playerNum: incoming.number?.trim() || undefined
       };
     }
 
-    // Wechsel im Spielverlauf protokollieren
     events = [
       {
         id: generateId('sub'),
@@ -752,12 +1044,14 @@
         setNumber: currentSetNumber,
         category: 'substitution',
         quality: 'neutral',
-        action: `Wechsel: ${incoming.name} (${incoming.role}) rein für ${outgoing.name} (${outgoing.role})`,
+        action: `Wechsel (${substitutionCount}/${MAX_SUBSTITUTIONS_PER_SET}): ${formatPlayerDisplay(incoming)} rein für ${formatPlayerDisplay(outgoing)}`,
         rotation: currentRotation as RotationPosition,
-        player: `${incoming.name} (${incoming.role})`,
+        player: formatPlayerDisplay(incoming),
+        playerNum: incoming.number?.trim() || undefined,
         position: currentPos,
         row,
-        team: 'myTeam'
+        team: 'myTeam',
+        undoSnapshot: undoSnap
       },
       ...events
     ];
@@ -767,6 +1061,7 @@
 
   function switchActiveLibero(libero: BenchPlayer) {
     if (activeLibero?.id === libero.id && liberoAutoSwap) return;
+    const undoSnap = createUndoSnapshot();
     activeLiberoId = libero.id;
     liberoAutoSwap = true;
 
@@ -778,10 +1073,12 @@
         setNumber: currentSetNumber,
         category: 'substitution',
         quality: 'neutral',
-        action: `Libero aktiv: ${libero.name} (L)`,
+        action: `Libero aktiv: ${formatPlayerDisplay({ ...libero, role: 'L' })}`,
         rotation: currentRotation as RotationPosition,
-        player: `${libero.name} (L)`,
-        team: 'myTeam'
+        player: formatPlayerDisplay({ ...libero, role: 'L' }),
+        playerNum: libero.number?.trim() || undefined,
+        team: 'myTeam',
+        undoSnapshot: undoSnap
       },
       ...events
     ];
@@ -866,30 +1163,33 @@
   }
 
   function logAction(actionItem: QuickAction) {
-    if (isMatchOver) return;
+    if (isPlayLocked) return;
     const id = generateId('act');
     const timestamp = formatEventTime();
-    const snapshot = {
-      myScore,
-      opponentScore,
-      servingTeam,
-      rotation: currentRotation as RotationPosition
-    };
+    const undoSnap = createUndoSnapshot();
     const eventRotation = currentRotation as RotationPosition;
-    const eventPlayer = selectedPlayer ? selectedPlayer.player : undefined;
-    const eventPosition = selectedPlayer ? selectedPlayer.position : undefined;
-    const eventRow = selectedPlayer ? selectedPlayer.row : undefined;
-    const eventTeam = selectedPlayer ? selectedPlayer.team : 'myTeam';
+    const prevServe = servingTeam;
+
+    // Cross-team attribution guard: never attribute an "own win" event to an opponent selection
+    const selectedIsMismatch =
+      selectedPlayer?.team === 'opponent' && actionItem.group === 'us';
+    const effectiveSelection = selectedIsMismatch ? null : selectedPlayer;
+
+    const eventPlayer = effectiveSelection ? effectiveSelection.player : undefined;
+    const eventPlayerNum = effectiveSelection ? effectiveSelection.playerNum : undefined;
+    const eventPosition = effectiveSelection ? effectiveSelection.position : undefined;
+    const eventRow = effectiveSelection ? effectiveSelection.row : undefined;
+    const eventTeam = effectiveSelection ? effectiveSelection.team : 'myTeam';
 
     let didSideout = false;
     if (actionItem.pointFor) {
-      const prevServe = servingTeam;
-      addPoint(actionItem.pointFor);
-      didSideout = prevServe !== servingTeam;
+      didSideout = addPoint(actionItem.pointFor);
     }
 
     const reachedRulebookEnd = Boolean(
-      actionItem.pointFor && !continuePast25 && checkRulebookWin(myScore, opponentScore) !== null
+      actionItem.pointFor &&
+        !continuePastTarget &&
+        checkSetWin(myScore, opponentScore, currentSetTarget) !== null
     );
 
     const newEvent: VolleyballEvent = {
@@ -903,21 +1203,32 @@
       action: actionItem.label,
       rotation: eventRotation,
       player: eventPlayer,
+      playerNum: eventPlayerNum,
       position: eventPosition,
       row: eventRow,
       team: eventTeam,
+      wasServing: prevServe,
       passRating: actionItem.passRating,
       scoreAfter: actionItem.pointFor ? `${myScore}:${opponentScore}` : undefined,
       isSideout: didSideout || undefined,
       isMatchEnd: reachedRulebookEnd || undefined,
-      scoreSnapshot: snapshot
+      undoSnapshot: undoSnap
     };
 
     saveStatus = 'idle';
     events = [newEvent, ...events];
+
+    if (autoClearAfterPoint && actionItem.pointFor) {
+      selectedPlayer = null;
+      subOutIndex = null;
+    }
   }
 
   function deleteEvent(id: string) {
+    if (events[0]?.id === id && (events[0].scoreAfter || events[0].category === 'timeout' || events[0].category === 'substitution') && (events[0].undoSnapshot || events[0].scoreSnapshot)) {
+      undoLastEvent();
+      return;
+    }
     events = events.filter((e) => e.id !== id);
   }
 
@@ -926,6 +1237,62 @@
       events = [];
     }
   }
+
+  // Tastatur-Shortcuts für Co-Trainer mit Laptop auf der Bank
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (step !== 'tracker' || showBetweenSetModal) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const key = e.key.toLowerCase();
+      if (key === 'z' && canUndoAction) {
+        e.preventDefault();
+        undoLastEvent();
+      } else if (key === 'b') {
+        e.preventDefault();
+        formationMode = 'base';
+      } else if (key === 'r') {
+        e.preventDefault();
+        formationMode = 'receive';
+      } else if (key === 'escape') {
+        selectedPlayer = null;
+        subOutIndex = null;
+      } else if (!isPlayLocked && key === 'q') {
+        e.preventDefault();
+        logManualPoint('us');
+      } else if (!isPlayLocked && key === 'w') {
+        e.preventDefault();
+        logManualPoint('them');
+      } else if (['1', '2', '3', '4', '5', '6'].includes(key)) {
+        const pos = Number(key) as RotationPosition;
+        const { player, playerNum, playerIndex } = getCourtPlayerLabelAtPos(pos, currentRotation);
+        const row: 'front' | 'back' = pos === 2 || pos === 3 || pos === 4 ? 'front' : 'back';
+        handleSelectPlayer({
+          team: 'myTeam',
+          position: pos,
+          player,
+          playerNum,
+          playerIndex,
+          rotation: currentRotation,
+          row,
+          isServer: pos === 1 && servingTeam === 'us'
+        });
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
 </script>
 
 <main
@@ -997,10 +1364,19 @@
           </div>
         </div>
         <div class="header-badges">
+          <button
+            type="button"
+            class="wakelock-btn"
+            class:active={wakeLockActive}
+            onclick={() => (wakeLockEnabled = !wakeLockEnabled)}
+            title="Bildschirm während des Spiels wach halten (Wake Lock)"
+          >
+            {wakeLockEnabled ? (wakeLockActive ? 'Display: Wach' : 'Display: Standby') : 'Display: Auto'}
+          </button>
           {#if !isMatchOver}
             <button
               type="button"
-              onclick={handleManualEndMatch}
+              onclick={() => handleManualEndMatch()}
               class="end-match-header-btn"
               title="Spiel manuell beenden (z.B. 5. Satz Tie-Break oder vorzeitiges Ende)"
             >
@@ -1044,7 +1420,7 @@
           </button>
         </div>
       {/if}
-      <!-- AUTOMATISCHE & MANUELLE SPIELENDE-ANZEIGE -->
+      <!-- AUTOMATISCHE & MANUELLE SPIELENDE- / SATZENDE-ANZEIGE -->
       {#if isMatchOver}
         <section
           class="match-over-banner"
@@ -1065,10 +1441,10 @@
                   {/if}
                 </h2>
                 <span class="mo-reason">
-                  {#if isRulebookMatchOver}
-                    Automatisch erkannt (Regelwerk: ≥25 Punkte & ≥2 Punkte Vorsprung)
+                  {#if isRulebookSetOver && !matchEndedManually}
+                    Automatisch entschieden ({matchFormat === 'bo5' ? 'Best of 5' : matchFormat === 'bo3' ? 'Best of 3' : 'Frei'} • Satz bis {currentSetTarget} / +2)
                   {:else}
-                    Manuell beendet (z.B. 5. Satz Tie-Break / vorzeitiges Spielende)
+                    Manuell beendet
                   {/if}
                 </span>
               </div>
@@ -1093,20 +1469,22 @@
           <!-- Kompakte Spielstatistik für direktes Coaching-Review -->
           <div class="mo-stats-grid">
             <div class="mo-stat">
-              <span class="mo-stat-val">{matchSummaryStats.aces}</span>
-              <span class="mo-stat-lbl">Asse</span>
+              <span class="mo-stat-val">
+                {matchAnalytics.sideoutPct !== null ? `${matchAnalytics.sideoutPct}%` : '–'}
+              </span>
+              <span class="mo-stat-lbl">Side-out ({matchAnalytics.sideoutWon}/{matchAnalytics.sideoutTotal})</span>
             </div>
             <div class="mo-stat">
-              <span class="mo-stat-val">{matchSummaryStats.kills}</span>
-              <span class="mo-stat-lbl">Kills</span>
+              <span class="mo-stat-val">{matchAnalytics.kills}</span>
+              <span class="mo-stat-lbl">Kills · {matchAnalytics.aces} Asse</span>
             </div>
             <div class="mo-stat">
-              <span class="mo-stat-val">{matchSummaryStats.blocks}</span>
+              <span class="mo-stat-val">{matchAnalytics.blocks}</span>
               <span class="mo-stat-lbl">Kill Blocks</span>
             </div>
             <div class="mo-stat">
-              <span class="mo-stat-val">{matchSummaryStats.passAvg}</span>
-              <span class="mo-stat-lbl">Ø Annahme ({matchSummaryStats.passCount})</span>
+              <span class="mo-stat-val">{matchAnalytics.passAvgFormatted}</span>
+              <span class="mo-stat-lbl">Ø Annahme ({matchAnalytics.passCount})</span>
             </div>
           </div>
 
@@ -1126,14 +1504,14 @@
             </div>
           {/if}
 
-          {#if saveMessage}
+          {#if saveMessage || copyShareFeedback}
             <div
               class="mo-save-feedback"
-              class:ok={saveStatus === 'saved'}
+              class:ok={saveStatus === 'saved' || Boolean(copyShareFeedback)}
               class:queued={saveStatus === 'queued'}
               class:err={saveStatus === 'error'}
             >
-              {saveMessage}
+              {copyShareFeedback ?? saveMessage}
             </div>
           {/if}
 
@@ -1143,14 +1521,14 @@
               class="mo-btn save"
               onclick={handleSaveMatch}
               disabled={saveStatus === 'saving'}
-              title="Komplettes Spiel inkl. aller Sätze, Aufstellung & Events über Go-Server in InfluxDB speichern"
+              title="Komplettes Spiel im lokalen Geräte-Archiv und (wenn aktiv) in InfluxDB speichern"
             >
               {#if saveStatus === 'saving'}
                 Speichere…
               {:else if saveStatus === 'saved'}
-                In DB gespeichert (Erneut sichern)
+                Gespeichert (Erneut sichern)
               {:else if saveStatus === 'queued'}
-                Lokal gesichert (Erneut versuchen)
+                Lokal gesichert (Sync testen)
               {:else}
                 Spiel speichern
               {/if}
@@ -1158,16 +1536,24 @@
             <button
               type="button"
               class="mo-btn primary"
-              onclick={handleNewSet}
-              title="Diesen Satz speichern und nächsten Satz bei 0:0 starten"
+              onclick={handleShareQuickSummary}
+              title="Kompakte Team-Statistik für WhatsApp/Signal kopieren"
             >
-              Nächster Satz (0:0)
+              WhatsApp Summary
+            </button>
+            <button
+              type="button"
+              class="mo-btn secondary"
+              onclick={handleNewSet}
+              title="Diesen Satz abschließen und noch einen weiteren Satz starten"
+            >
+              + Weiterer Satz
             </button>
             <button
               type="button"
               class="mo-btn secondary"
               onclick={undoLastEvent}
-              disabled={!canUndoScoreAction}
+              disabled={!canUndoAction}
               title="Letzten Punkt bzw. Spielende rückgängig machen"
             >
               Undo
@@ -1176,7 +1562,7 @@
               type="button"
               class="mo-btn secondary"
               onclick={handleResumeMatch}
-              title="Aktuellen Satz ohne 25-Punkte-Sperre weiterspielen"
+              title="Aktuellen Satz ohne Punktesperre weiterspielen"
             >
               Weiterspielen
             </button>
@@ -1198,18 +1584,80 @@
             </button>
           </div>
         </section>
+      {:else if isSetOver}
+        <section
+          class="match-over-banner set-over-banner"
+          class:won-us={rulebookSetWinner === 'us'}
+          class:won-them={rulebookSetWinner === 'them'}
+          aria-live="polite"
+        >
+          <div class="mo-top">
+            <div class="mo-headline">
+              <div>
+                <h2 class="mo-title">
+                  Satz {currentSetNumber} beendet —
+                  {myScore > opponentScore
+                    ? `${matchData.teamName} gewinnt (${myScore}:${opponentScore})`
+                    : `${matchData.opponentName} gewinnt (${myScore}:${opponentScore})`}
+                </h2>
+                <span class="mo-reason">
+                  Satzstand: {setsStanding.us}:{setsStanding.them}
+                  {setsToWinMatch ? ` • Ziel: ${setsToWinMatch} Gewinnsätze` : ' • Freies Spiel'}
+                </span>
+              </div>
+            </div>
+            <div class="mo-final-score">
+              <span class="mo-score-nums">Sätze {setsStanding.us} : {setsStanding.them}</span>
+            </div>
+          </div>
+
+          <div class="mo-actions">
+            <button
+              type="button"
+              class="mo-btn save"
+              onclick={handleNewSet}
+              title="Satz {currentSetNumber} abschließen und Satz {currentSetNumber + 1} starten"
+            >
+              Satz {currentSetNumber + 1} starten →
+            </button>
+            <button
+              type="button"
+              class="mo-btn secondary"
+              onclick={undoLastEvent}
+              disabled={!canUndoAction}
+            >
+              Undo letzter Punkt
+            </button>
+            <button
+              type="button"
+              class="mo-btn secondary"
+              onclick={handleResumeMatch}
+            >
+              Satz weiterspielen
+            </button>
+            <button
+              type="button"
+              class="mo-btn dark"
+              onclick={() => handleManualEndMatch(true)}
+            >
+              Spiel jetzt beenden & speichern
+            </button>
+          </div>
+        </section>
       {/if}
 
       <div class="col-court">
       <!-- SMART SCOREBOARD & IMPLIZITES SIDE-OUT TRACKING -->
       <section
         class="scoreboard-section"
-        class:match-over={isMatchOver}
+        class:match-over={isPlayLocked}
         aria-label="Smart Scoreboard"
       >
         <div class="sb-toolbar">
           {#if isMatchOver}
-            <span class="sb-phase-pill match-ended">Spiel beendet ({myScore}:{opponentScore})</span>
+            <span class="sb-phase-pill match-ended">Spiel beendet ({setsStanding.us}:{setsStanding.them})</span>
+          {:else if isSetOver}
+            <span class="sb-phase-pill match-ended">Satz {currentSetNumber} beendet ({myScore}:{opponentScore})</span>
           {:else if servingTeam === 'us'}
             <span class="sb-phase-pill serving-us">Eigener Aufschlag (Break)</span>
           {:else}
@@ -1221,8 +1669,8 @@
               type="button"
               class="sb-util-btn"
               onclick={undoLastEvent}
-              disabled={!canUndoScoreAction}
-              title="Letzte Aktion inkl. Punkt & Rotation rückgängig machen"
+              disabled={!canUndoAction}
+              title="Letzte Aktion (Punkt/Auszeit/Wechsel) rückgängig machen"
             >
               Undo
             </button>
@@ -1230,53 +1678,60 @@
               type="button"
               class="sb-util-btn"
               onclick={handleNewSet}
-              title="Neuen Satz starten (0:0)"
+              title="Nächsten Satz vorbereiten / starten"
             >
-              0:0 Satz
+              Satz +{currentSetNumber + 1}
             </button>
             <button
               type="button"
               class="sb-util-btn end-btn"
-              onclick={handleManualEndMatch}
+              onclick={() => handleManualEndMatch()}
               disabled={isMatchOver}
-              title="Spiel manuell beenden (z.B. 5. Satz Tie-Break bei 15 Punkten)"
+              title="Spiel manuell komplett beenden"
             >
               Ende
             </button>
           </div>
         </div>
 
-        {#if completedSets.length > 0 || crunchTimeHint}
-          <div class="sb-meta-row">
-            {#if completedSets.length > 0}
-              <div class="sb-sets-strip">
-                {#each completedSets as s (s.setNumber)}
-                  <span class="sb-set-pill">S{s.setNumber} {s.myScore}:{s.opponentScore}</span>
-                {/each}
-                <span class="sb-set-pill active">
-                  Satz {currentSetNumber}{currentSetNumber === 5 ? ' (Tie-Break)' : ''}
-                </span>
-              </div>
-            {/if}
-            {#if crunchTimeHint}
-              <span class="sb-crunch-pill">{crunchTimeHint}</span>
-            {/if}
+        <div class="sb-meta-row">
+          <div class="sb-sets-strip">
+            {#each completedSets as s (s.setNumber)}
+              <span class="sb-set-pill">S{s.setNumber} {s.myScore}:{s.opponentScore}</span>
+            {/each}
+            <span class="sb-set-pill active">
+              Satz {currentSetNumber} (Ziel {currentSetTarget})
+            </span>
           </div>
-        {/if}
+          {#if crunchTimeHint}
+            <span class="sb-crunch-pill">{crunchTimeHint}</span>
+          {/if}
+        </div>
 
         <div class="sb-board">
           <!-- UNSER TEAM -->
-          <div class="sb-team us" class:is-serving={servingTeam === 'us' && !isMatchOver}>
-            <button
-              type="button"
-              class="sb-serve-pill"
-              class:active={servingTeam === 'us'}
-              disabled={isMatchOver}
-              onclick={() => setServingTeamManual('us')}
-              title="Aufschlagrecht manuell auf eigenes Team setzen"
-            >
-              {servingTeam === 'us' ? 'AUFSCHLAG' : 'Aufschlag hier'}
-            </button>
+          <div class="sb-team us" class:is-serving={servingTeam === 'us' && !isPlayLocked}>
+            <div class="sb-team-top-row">
+              <button
+                type="button"
+                class="sb-serve-pill"
+                class:active={servingTeam === 'us'}
+                disabled={isPlayLocked}
+                onclick={() => setServingTeamManual('us')}
+                title="Aufschlagrecht manuell auf eigenes Team setzen"
+              >
+                {servingTeam === 'us' ? 'AUFSCHLAG' : 'Aufschlag'}
+              </button>
+              <button
+                type="button"
+                class="sb-to-btn"
+                disabled={isPlayLocked || timeoutsUs >= MAX_TIMEOUTS_PER_SET}
+                onclick={() => callTimeout('us')}
+                title="Auszeit für eigenes Team protokollieren"
+              >
+                AZ {timeoutsUs}/{MAX_TIMEOUTS_PER_SET}
+              </button>
+            </div>
             <span class="sb-team-name">{matchData.teamName}</span>
             <span class="sb-score">{myScore}</span>
             <div class="sb-btn-row">
@@ -1293,7 +1748,7 @@
                 type="button"
                 class="sb-plus-btn us"
                 onclick={() => logManualPoint('us')}
-                disabled={isMatchOver}
+                disabled={isPlayLocked}
                 aria-label="Punkt für eigenes Team"
               >
                 +1 {servingTeam === 'them' ? '↻' : ''}
@@ -1308,17 +1763,28 @@
           </div>
 
           <!-- GEGNER -->
-          <div class="sb-team them" class:is-serving={servingTeam === 'them' && !isMatchOver}>
-            <button
-              type="button"
-              class="sb-serve-pill them"
-              class:active={servingTeam === 'them'}
-              disabled={isMatchOver}
-              onclick={() => setServingTeamManual('them')}
-              title="Aufschlagrecht manuell auf Gegner setzen"
-            >
-              {servingTeam === 'them' ? 'AUFSCHLAG' : 'Aufschlag hier'}
-            </button>
+          <div class="sb-team them" class:is-serving={servingTeam === 'them' && !isPlayLocked}>
+            <div class="sb-team-top-row">
+              <button
+                type="button"
+                class="sb-serve-pill them"
+                class:active={servingTeam === 'them'}
+                disabled={isPlayLocked}
+                onclick={() => setServingTeamManual('them')}
+                title="Aufschlagrecht manuell auf Gegner setzen"
+              >
+                {servingTeam === 'them' ? 'AUFSCHLAG' : 'Aufschlag'}
+              </button>
+              <button
+                type="button"
+                class="sb-to-btn"
+                disabled={isPlayLocked || timeoutsThem >= MAX_TIMEOUTS_PER_SET}
+                onclick={() => callTimeout('them')}
+                title="Auszeit für Gegner protokollieren"
+              >
+                AZ {timeoutsThem}/{MAX_TIMEOUTS_PER_SET}
+              </button>
+            </div>
             <span class="sb-team-name">{matchData.opponentName}</span>
             <span class="sb-score">{opponentScore}</span>
             <div class="sb-btn-row">
@@ -1335,7 +1801,7 @@
                 type="button"
                 class="sb-plus-btn them"
                 onclick={() => logManualPoint('them')}
-                disabled={isMatchOver}
+                disabled={isPlayLocked}
                 aria-label="Punkt für Gegner"
               >
                 +1
@@ -1349,14 +1815,18 @@
       <section class="court-section">
         <Court
           bind:currentRotation
+          bind:opponentRotation
           bind:selectedPlayer
           bind:formationMode
+          bind:courtFlipped
           servingTeam={servingTeam}
           myTeamName={matchData.teamName}
           opponentName={matchData.opponentName}
+          system={matchData.system}
           myTeamLineup={courtPlayers}
-          opponentLineup={opponentLineup}
+          bind:opponentLineup
           activeLiberoName={effectiveLiberoName}
+          liberoCanServe={liberoCanServe}
           onSelectPlayer={handleSelectPlayer}
           onRotationChange={handleRotationChange}
         />
@@ -1372,7 +1842,7 @@
         >
           <div class="sub-header-left">
             <span class="sub-title">Spielerwechsel & Bank</span>
-            <span class="sub-count-badge">Wechsel: {substitutionCount}/6</span>
+            <span class="sub-count-badge">Wechsel: {substitutionCount}/{MAX_SUBSTITUTIONS_PER_SET}</span>
             {#if activeLibero}
               <span class="libero-status-pill" class:paused={!liberoAutoSwap}>
                 {activeLibero.name} {liberoAutoSwap ? '' : '(Pausiert)'}
@@ -1389,10 +1859,16 @@
               <div class="libero-control-box">
                 <div class="libero-box-top">
                   <span class="sub-group-label">Registrierte Liberos</span>
-                  <label class="auto-swap-toggle">
-                    <input type="checkbox" bind:checked={liberoAutoSwap} />
-                    <span>Auto-Wechsel für MB</span>
-                  </label>
+                  <div class="libero-toggles">
+                    <label class="auto-swap-toggle">
+                      <input type="checkbox" bind:checked={liberoAutoSwap} />
+                      <span>Auto-Wechsel für MB</span>
+                    </label>
+                    <label class="auto-swap-toggle">
+                      <input type="checkbox" bind:checked={liberoCanServe} />
+                      <span>Libero darf aufschlagen</span>
+                    </label>
+                  </div>
                 </div>
 
                 <div class="libero-pills">
@@ -1403,7 +1879,7 @@
                       class:active={activeLibero?.id === lib.id && liberoAutoSwap}
                       onclick={() => switchActiveLibero(lib)}
                     >
-                      {lib.name} (L)
+                      {formatPlayerDisplay({ ...lib, role: 'L' })}
                       {#if activeLibero?.id === lib.id && liberoAutoSwap}
                         <span class="active-tag">AKTIV</span>
                       {/if}
@@ -1421,13 +1897,23 @@
                   <button
                     type="button"
                     class="reset-subs-link"
-                    onclick={() => (substitutionCount = 0)}
+                    onclick={() => {
+                      substitutionCount = 0;
+                      subPairs = [];
+                      subWarning = null;
+                    }}
                     title="Wechselzähler für neuen Satz zurücksetzen"
                   >
-                    Neuer Satz (0/6)
+                    Zähler zurücksetzen (0/{MAX_SUBSTITUTIONS_PER_SET})
                   </button>
                 {/if}
               </div>
+
+              {#if subWarning}
+                <div class="sub-warning-box" role="alert">
+                  {subWarning}
+                </div>
+              {/if}
 
               {#if regularBenchPlayers.length === 0}
                 <p class="no-bench-msg">
@@ -1446,7 +1932,7 @@
                         onclick={() => (subOutIndex = subOutIndex === idx ? null : idx)}
                       >
                         <span class="p-pos">P{curPos}</span>
-                        <span class="p-name">{cp.name}</span>
+                        <span class="p-name">{cp.number ? `#${cp.number} ` : ''}{cp.name}</span>
                         <span class="p-role">{cp.role}</span>
                       </button>
                     {/each}
@@ -1463,7 +1949,7 @@
                         class:selected={subInBenchId === bp.id}
                         onclick={() => (subInBenchId = subInBenchId === bp.id ? null : bp.id)}
                       >
-                        <span class="p-name">{bp.name}</span>
+                        <span class="p-name">{bp.number ? `#${bp.number} ` : ''}{bp.name}</span>
                         <span class="p-role">{bp.role}</span>
                       </button>
                     {/each}
@@ -1473,7 +1959,7 @@
                 <button
                   type="button"
                   class="confirm-sub-btn"
-                  disabled={isMatchOver || subOutIndex === null || !subInBenchId}
+                  disabled={isPlayLocked || subOutIndex === null || !subInBenchId}
                   onclick={performSubstitution}
                 >
                   Wechsel jetzt durchführen
@@ -1486,12 +1972,27 @@
       </div>
 
       <div class="col-scouting">
+      <LiveCoachPanel
+        events={events}
+        currentSetNumber={currentSetNumber}
+        currentRotation={currentRotation as RotationPosition}
+        initialServe={setInitialServe}
+        isMatchOver={isPlayLocked}
+        onAddNote={addQuickNote}
+      />
+
       <!-- Scouting Quick Actions -->
       <section class="actions-section" aria-label="Aktions-Erfassung">
         <div class="section-header">
-          <h2 class="section-title">Quick Actions & Scouting</h2>
-          {#if isMatchOver}
-            <span class="match-locked-tag">Spiel beendet — Aktionen gesperrt</span>
+          <div class="sh-left">
+            <h2 class="section-title">Quick Actions & Scouting</h2>
+            <label class="auto-clear-toggle" title="Spielerauswahl nach jedem Punkt automatisch aufheben">
+              <input type="checkbox" bind:checked={autoClearAfterPoint} />
+              <span>Nach Punkt abwählen</span>
+            </label>
+          </div>
+          {#if isPlayLocked}
+            <span class="match-locked-tag">Satz/Spiel beendet — gesperrt</span>
           {:else if selectedPlayer}
             <span class="target-tag">
               Ziel: <strong>{selectedPlayer.player}</strong> (P{selectedPlayer.position})
@@ -1560,7 +2061,7 @@
                   <button
                     type="button"
                     class="action-btn {variant}"
-                    disabled={isMatchOver}
+                    disabled={isPlayLocked}
                     onclick={() => logAction(actionItem)}
                   >
                     <span class="action-label">{actionItem.label}</span>
@@ -1581,6 +2082,9 @@
             </div>
           {/each}
         </div>
+        <p class="shortcut-hint">
+          Tastatur: Q = +1 Wir · W = +1 Gegner · Z = Undo · 1–6 = Pos wählen · B/R = Formation
+        </p>
       </section>
 
       <!-- Event History Log -->
@@ -1647,6 +2151,19 @@
       </section>
       </div>
     </div>
+
+    <BetweenSetModal
+      open={showBetweenSetModal}
+      nextSetNumber={myScore > 0 || opponentScore > 0 ? completedSets.length + 2 : completedSets.length + 1}
+      targetPoints={getSetTargetPoints(myScore > 0 || opponentScore > 0 ? completedSets.length + 2 : completedSets.length + 1, matchFormat)}
+      teamName={matchData.teamName}
+      opponentName={matchData.opponentName}
+      defaultServe={setInitialServe === 'us' ? 'them' : 'us'}
+      defaultRotation={(matchData.startingRotation ?? 1) as RotationPosition}
+      hasSubstitutions={substitutionCount > 0}
+      onCancel={() => (showBetweenSetModal = false)}
+      onConfirm={confirmStartNewSet}
+    />
   {/if}
 
   <!-- GLOBALER APP FOOTER (FÜR ALLE INTERFACES) -->
@@ -3394,6 +3911,111 @@
 
     .footer-meta {
       justify-content: flex-end;
+    }
+  }
+
+  .wakelock-btn {
+    border: 1px solid #334155;
+    background: #1e293b;
+    color: #94a3b8;
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    cursor: pointer;
+    transition: all 0.12s;
+    touch-action: manipulation;
+  }
+
+  .wakelock-btn.active {
+    background: #064e3b;
+    border-color: #10b981;
+    color: #a7f3d0;
+  }
+
+  .set-over-banner {
+    border-width: 2px;
+  }
+
+  .sb-team-top-row {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .sb-to-btn {
+    border: 1px solid #cbd5e1;
+    background: #f8fafc;
+    color: #334155;
+    border-radius: 999px;
+    padding: 3px 8px;
+    font-size: 0.68rem;
+    font-weight: 800;
+    cursor: pointer;
+    transition: background 0.12s;
+    touch-action: manipulation;
+  }
+
+  .sb-to-btn:hover:not(:disabled) {
+    background: #fef3c7;
+    border-color: #f59e0b;
+    color: #92400e;
+  }
+
+  .sb-to-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .libero-toggles {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .sub-warning-box {
+    margin: 6px 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    color: #92400e;
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
+
+  .sh-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .auto-clear-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #475569;
+    cursor: pointer;
+  }
+
+  .shortcut-hint {
+    display: none;
+    margin: 8px 0 0;
+    font-size: 0.7rem;
+    color: #94a3b8;
+    font-weight: 600;
+  }
+
+  @media (min-width: 900px) {
+    .shortcut-hint {
+      display: block;
     }
   }
 </style>

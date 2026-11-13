@@ -5,17 +5,26 @@
     fetchSavedMatchById,
     getOfflineOutbox,
     removeOfflineMatch,
+    getLocalArchive,
+    saveMatchToLocalArchive,
+    removeLocalArchiveMatch,
     syncOfflineOutbox,
     getStoredApiKey,
     setStoredApiKey,
     ApiUnauthorizedError,
     ApiNetworkError
   } from './api';
+  import { computeMatchAnalytics } from './analytics';
+  import {
+    buildCoachShareText,
+    buildMatchCsv,
+    downloadTextFile,
+    parseImportedMatchJson
+  } from './export';
+  import { computeSetsStanding } from './matchEngine';
   import type {
     SavedMatchSummary,
-    VolleyballMatchPayload,
-    VolleyballEvent,
-    RotationPosition
+    VolleyballMatchPayload
   } from './types';
 
   let { onBack, onOutboxChange } = $props<{
@@ -25,6 +34,7 @@
 
   let savedMatches = $state<SavedMatchSummary[]>([]);
   let outboxMatches = $state<VolleyballMatchPayload[]>([]);
+  let localArchiveMatches = $state<VolleyballMatchPayload[]>([]);
   let loadingList = $state(true);
   let listError = $state<string | null>(null);
 
@@ -34,44 +44,23 @@
 
   let syncingOutbox = $state(false);
   let syncFeedback = $state<string | null>(null);
+  let copyFeedback = $state<string | null>(null);
 
   let showPinBox = $state(false);
   let apiKeyInput = $state(getStoredApiKey());
-
-  const OWN_ERROR_IDS = new Set([
-    'err_serve',
-    'err_rcv',
-    'err_atk',
-    'atk_blocked',
-    'err_set',
-    'err_net',
-    'err_def'
-  ]);
-
-  const US_POINT_IDS = new Set([
-    'ace',
-    'kill',
-    'tip_kill',
-    'block',
-    'opp_err_serve',
-    'opp_err'
-  ]);
-
-  const THEM_POINT_IDS = new Set([
-    'err_serve',
-    'err_rcv',
-    'err_atk',
-    'atk_blocked',
-    'err_set',
-    'err_net',
-    'err_def',
-    'opp_kill'
-  ]);
+  let importInputEl: HTMLInputElement | undefined = $state();
 
   function refreshOutbox() {
     outboxMatches = getOfflineOutbox();
+    localArchiveMatches = getLocalArchive();
     onOutboxChange?.(outboxMatches.length);
   }
+
+  // Local archive items that are not already represented on the remote server list
+  const localOnlyMatches = $derived.by(() => {
+    const serverIds = new Set(savedMatches.map((m) => m.matchId));
+    return localArchiveMatches.filter((m) => !serverIds.has(m.matchId));
+  });
 
   async function loadList() {
     loadingList = true;
@@ -81,9 +70,9 @@
       savedMatches = await fetchSavedMatches(apiKeyInput);
     } catch (err) {
       if (err instanceof ApiNetworkError) {
-        listError = 'Go-Server aktuell nicht erreichbar. Offline gespeicherte Spiele bleiben unten verfügbar.';
+        listError = 'Go-Server aktuell nicht erreichbar. Lokal gespeicherte Spiele bleiben unten verfügbar.';
       } else {
-        listError = err instanceof Error ? err.message : 'Fehler beim Laden der Spiele.';
+        listError = 'Kein Server-Archiv aktiv — lokale Geräte-Einträge werden angezeigt.';
       }
     } finally {
       loadingList = false;
@@ -126,7 +115,15 @@
   }
 
   function handleDeleteOutboxItem(matchId: string) {
-    if (!confirm('Dieses lokal vorgemerkte Spiel wirklich verwerfen?')) return;
+    if (!confirm('Dieses lokal vorgemerkte Spiel aus der Upload-Warteschlange entfernen?')) return;
+    removeOfflineMatch(matchId);
+    refreshOutbox();
+  }
+
+  function handleDeleteLocalMatch(matchId: string, e: MouseEvent) {
+    e.stopPropagation();
+    if (!confirm('Dieses lokal gespeicherte Spiel wirklich vom Gerät löschen?')) return;
+    removeLocalArchiveMatch(matchId);
     removeOfflineMatch(matchId);
     refreshOutbox();
     if (selectedMatch?.matchId === matchId) {
@@ -147,9 +144,54 @@
     }
   }
 
-  function openOutboxMatch(item: VolleyballMatchPayload) {
+  function openLocalMatch(item: VolleyballMatchPayload) {
     selectedSetFilter = 'all';
     selectedMatch = item;
+  }
+
+  async function handleImportJson(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const imported = parseImportedMatchJson(text);
+      saveMatchToLocalArchive({ ...imported, syncState: 'local' });
+      refreshOutbox();
+      syncFeedback = `Spiel "${imported.teamName} vs ${imported.opponentName}" lokal importiert.`;
+    } catch (err) {
+      syncFeedback = err instanceof Error ? err.message : 'JSON-Import fehlgeschlagen.';
+    } finally {
+      input.value = '';
+    }
+  }
+
+  async function handleCopySummary() {
+    if (!selectedMatch) return;
+    const text = buildCoachShareText(selectedMatch);
+    try {
+      await navigator.clipboard.writeText(text);
+      copyFeedback = 'Team-Zusammenfassung in Zwischenablage kopiert!';
+    } catch {
+      copyFeedback = 'Kopieren nicht möglich — bitte CSV/JSON Export nutzen.';
+    }
+    setTimeout(() => (copyFeedback = null), 3000);
+  }
+
+  function handleExportCsv() {
+    if (!selectedMatch) return;
+    const safeName = `${selectedMatch.teamName}_vs_${selectedMatch.opponentName}`.replace(/[^a-zA-Z0-9_-]+/g, '_');
+    downloadTextFile(`${safeName}.csv`, buildMatchCsv(selectedMatch), 'text/csv;charset=utf-8');
+  }
+
+  function handleExportJson() {
+    if (!selectedMatch) return;
+    const safeName = `${selectedMatch.teamName}_vs_${selectedMatch.opponentName}`.replace(/[^a-zA-Z0-9_-]+/g, '_');
+    downloadTextFile(
+      `${safeName}.json`,
+      JSON.stringify(selectedMatch, null, 2),
+      'application/json;charset=utf-8'
+    );
   }
 
   function formatMatchDate(iso: string): string {
@@ -165,131 +207,21 @@
     });
   }
 
-  // Chronological or filtered events for selected match
-  const filteredEvents = $derived.by<VolleyballEvent[]>(() => {
+  const filteredEvents = $derived.by(() => {
     if (!selectedMatch) return [];
     const list = selectedMatch.events ?? [];
     if (selectedSetFilter === 'all') return list;
     return list.filter((ev) => (ev.setNumber ?? 1) === selectedSetFilter);
   });
 
-  // Aggregated KPIs for the currently selected set filter
-  const detailKpis = $derived.by(() => {
-    let aces = 0;
-    let kills = 0;
-    let blocks = 0;
-    let ownErrors = 0;
-    let sideouts = 0;
-    let passSum = 0;
-    let passCount = 0;
-
-    for (const ev of filteredEvents) {
-      if (ev.actionId === 'ace') aces++;
-      if (ev.actionId === 'kill' || ev.actionId === 'tip_kill') kills++;
-      if (ev.actionId === 'block') blocks++;
-      if (ev.actionId && OWN_ERROR_IDS.has(ev.actionId)) ownErrors++;
-      if (ev.isSideout) sideouts++;
-      if (ev.passRating !== undefined) {
-        passSum += ev.passRating;
-        passCount++;
-      }
-    }
-
-    return {
-      aces,
-      kills,
-      blocks,
-      ownErrors,
-      sideouts,
-      passAvg: passCount > 0 ? (passSum / passCount).toFixed(2) : '–',
-      passCount
-    };
-  });
-
-  // Per-Player breakdown
-  interface PlayerStatRow {
-    player: string;
-    kills: number;
-    aces: number;
-    blocks: number;
-    errors: number;
-    passSum: number;
-    passCount: number;
-    totalContacts: number;
-  }
-
-  const playerStats = $derived.by<PlayerStatRow[]>(() => {
-    const map = new Map<string, PlayerStatRow>();
-    for (const ev of filteredEvents) {
-      if (!ev.player || ev.team === 'opponent' || ev.category === 'substitution') continue;
-      let row = map.get(ev.player);
-      if (!row) {
-        row = {
-          player: ev.player,
-          kills: 0,
-          aces: 0,
-          blocks: 0,
-          errors: 0,
-          passSum: 0,
-          passCount: 0,
-          totalContacts: 0
-        };
-        map.set(ev.player, row);
-      }
-      row.totalContacts += 1;
-      if (ev.actionId === 'kill' || ev.actionId === 'tip_kill') row.kills += 1;
-      if (ev.actionId === 'ace') row.aces += 1;
-      if (ev.actionId === 'block') row.blocks += 1;
-      if (ev.actionId && OWN_ERROR_IDS.has(ev.actionId)) row.errors += 1;
-      if (ev.passRating !== undefined) {
-        row.passSum += ev.passRating;
-        row.passCount += 1;
-      }
-    }
-
-    return Array.from(map.values()).sort(
-      (a, b) => b.kills + b.aces + b.blocks - (a.kills + a.aces + a.blocks) || b.totalContacts - a.totalContacts
-    );
-  });
-
-  // Per-Rotation (R1–R6) efficiency
-  interface RotationStat {
-    rot: RotationPosition;
-    won: number;
-    lost: number;
-    diff: number;
-  }
-
-  const rotationStats = $derived.by<RotationStat[]>(() => {
-    const base: Record<number, { won: number; lost: number }> = {
-      1: { won: 0, lost: 0 },
-      2: { won: 0, lost: 0 },
-      3: { won: 0, lost: 0 },
-      4: { won: 0, lost: 0 },
-      5: { won: 0, lost: 0 },
-      6: { won: 0, lost: 0 }
-    };
-
-    for (const ev of filteredEvents) {
-      const r = ev.rotation;
-      if (!base[r]) continue;
-      if (ev.actionId && US_POINT_IDS.has(ev.actionId)) {
-        base[r].won += 1;
-      } else if (ev.actionId && THEM_POINT_IDS.has(ev.actionId)) {
-        base[r].lost += 1;
-      } else if (!ev.actionId && ev.scoreAfter) {
-        if (ev.team === 'myTeam' && ev.quality === 'good') base[r].won += 1;
-        if (ev.team === 'opponent' && ev.quality === 'bad') base[r].lost += 1;
-      }
-    }
-
-    return ([1, 2, 3, 4, 5, 6] as RotationPosition[]).map((rot) => ({
-      rot,
-      won: base[rot].won,
-      lost: base[rot].lost,
-      diff: base[rot].won - base[rot].lost
-    }));
-  });
+  const analytics = $derived(
+    selectedMatch
+      ? computeMatchAnalytics(selectedMatch.events ?? [], {
+          setFilter: selectedSetFilter,
+          initialServe: selectedMatch.initialServe ?? 'us'
+        })
+      : null
+  );
 </script>
 
 <div class="history-view">
@@ -323,6 +255,23 @@
       </div>
 
       <div class="hv-actions">
+        {#if !selectedMatch}
+          <input
+            type="file"
+            accept="application/json,.json"
+            bind:this={importInputEl}
+            onchange={handleImportJson}
+            style="display: none;"
+          />
+          <button
+            type="button"
+            class="hv-util-btn"
+            onclick={() => importInputEl?.click()}
+            title="Exportiertes JSON-Spiel importieren"
+          >
+            JSON Import
+          </button>
+        {/if}
         <button
           type="button"
           class="hv-util-btn"
@@ -395,7 +344,7 @@
                   </span>
                 </div>
                 <div class="outbox-item-btns">
-                  <button type="button" class="ob-open-btn" onclick={() => openOutboxMatch(ob)}>
+                  <button type="button" class="ob-open-btn" onclick={() => openLocalMatch(ob)}>
                     Analyse öffnen
                   </button>
                   <button
@@ -417,17 +366,95 @@
         <div class="error-banner">{listError}</div>
       {/if}
 
+      <!-- LOKALES GERÄTE-ARCHIV (FUNKTIONIERT AUCH OHNE SERVER) -->
+      {#if localOnlyMatches.length > 0}
+        <section class="local-archive-sec" aria-label="Lokal auf diesem Gerät gespeicherte Spiele">
+          <div class="local-sec-head">
+            <h2 class="local-sec-title">Auf diesem Gerät gespeichert ({localOnlyMatches.length})</h2>
+            <span class="local-sec-sub">Funktioniert komplett ohne Server / Datenbank</span>
+          </div>
+          <div class="matches-grid">
+            {#each localOnlyMatches as lm (lm.matchId)}
+              {@const stand = computeSetsStanding(lm.sets)}
+              {@const mAnalytics = computeMatchAnalytics(lm.events ?? [], {
+                initialServe: lm.initialServe ?? 'us'
+              })}
+              <div
+                class="match-card local-card"
+                class:won={lm.winner === 'us'}
+                class:lost={lm.winner === 'them'}
+                role="button"
+                tabindex="0"
+                onclick={() => openLocalMatch(lm)}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    openLocalMatch(lm);
+                  }
+                }}
+              >
+                <div class="mc-top">
+                  <span class="mc-date">{formatMatchDate(lm.startedAt)}</span>
+                  <div class="mc-badges-right">
+                    <span class="mc-local-pill">Lokal</span>
+                    <span class="mc-badge {lm.winner}">
+                      {lm.winner === 'us' ? 'Sieg' : lm.winner === 'them' ? 'Niederlage' : 'Remis'}
+                    </span>
+                    <button
+                      type="button"
+                      class="mc-del-btn"
+                      title="Lokales Spiel löschen"
+                      onclick={(e) => handleDeleteLocalMatch(lm.matchId, e)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+
+                <div class="mc-teams-row">
+                  <div class="mc-teams">
+                    <span class="mc-team-us">{lm.teamName}</span>
+                    <span class="mc-vs">vs</span>
+                    <span class="mc-team-them">{lm.opponentName}</span>
+                  </div>
+                  <div class="mc-sets-score">
+                    {stand.us} : {stand.them}
+                  </div>
+                </div>
+
+                {#if lm.sets.length > 0}
+                  <div class="mc-set-chips">
+                    {#each lm.sets as s (s.setNumber)}
+                      <span class="mc-set-pill">S{s.setNumber} {s.myScore}:{s.opponentScore}</span>
+                    {/each}
+                    <span class="mc-sys-pill">{lm.system}</span>
+                  </div>
+                {/if}
+
+                <div class="mc-kpis">
+                  <span>{mAnalytics.aces} Asse</span>
+                  <span>{mAnalytics.kills} Kills</span>
+                  <span>{mAnalytics.blocks} Blocks</span>
+                  <span>SO {mAnalytics.sideoutPct !== null ? `${mAnalytics.sideoutPct}%` : '–'}</span>
+                  <span>Ø {mAnalytics.passAvgFormatted}</span>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
+
       {#if loadingList || loadingDetail}
-        <div class="loading-box">Lade gespeicherte Spiele aus InfluxDB…</div>
-      {:else if savedMatches.length === 0}
+        <div class="loading-box">Lade gespeicherte Spiele…</div>
+      {:else if savedMatches.length === 0 && localOnlyMatches.length === 0}
         <div class="empty-archive">
-          <h2>Noch keine Spiele in der Datenbank</h2>
+          <h2>Noch keine gespeicherten Spiele</h2>
           <p>
-            Beende ein Spiel im Live-Tracker (automatisch bei 25+ Punkten oder über „Spiel beenden“)
-            und tippe auf <strong>„Spiel speichern“</strong>.
+            Beende ein Spiel im Live-Tracker und tippe auf <strong>„Spiel speichern“</strong> (funktioniert lokal auch offline),
+            oder importiere oben ein gespeichertes JSON-Spiel.
           </p>
         </div>
-      {:else}
+      {:else if savedMatches.length > 0}
         <div class="matches-grid">
           {#each savedMatches as m (m.matchId)}
             <button
@@ -505,17 +532,32 @@
             {#if selectedMatch.players && selectedMatch.players.length > 0}
               <span class="roster-line">
                 <strong>Start-6:</strong>
-                {selectedMatch.players.map((p) => `P${p.position} ${p.name} (${p.role})`).join(' · ')}
+                {selectedMatch.players.map((p) => `P${p.position} ${p.number ? `#${p.number} ` : ''}${p.name} (${p.role})`).join(' · ')}
               </span>
             {/if}
             {#if selectedMatch.bench && selectedMatch.bench.length > 0}
               <span class="roster-line">
                 <strong>Bank / Libero:</strong>
-                {selectedMatch.bench.map((b) => `${b.name} (${b.isLibero ? 'L' : b.role})`).join(' · ')}
+                {selectedMatch.bench.map((b) => `${b.number ? `#${b.number} ` : ''}${b.name} (${b.isLibero ? 'L' : b.role})`).join(' · ')}
               </span>
             {/if}
           </div>
         {/if}
+
+        <div class="dh-export-row">
+          <button type="button" class="exp-btn primary" onclick={handleCopySummary}>
+            WhatsApp / Text kopieren
+          </button>
+          <button type="button" class="exp-btn" onclick={handleExportCsv}>
+            CSV Export
+          </button>
+          <button type="button" class="exp-btn" onclick={handleExportJson}>
+            JSON Backup
+          </button>
+          {#if copyFeedback}
+            <span class="exp-feedback">{copyFeedback}</span>
+          {/if}
+        </div>
       </section>
 
       <!-- SATZ-FILTER TABS -->
@@ -545,85 +587,100 @@
       </div>
 
       <!-- KPI ÜBERSICHT -->
-      <div class="kpi-strip">
-        <div class="kpi-box">
-          <span class="kpi-num">{detailKpis.aces}</span>
-          <span class="kpi-lbl">Asse</span>
+      {#if analytics}
+        <div class="kpi-strip">
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.sideoutPct !== null ? `${analytics.sideoutPct}%` : '–'}</span>
+            <span class="kpi-lbl">Side-out ({analytics.sideoutWon}/{analytics.sideoutTotal})</span>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.breakPct !== null ? `${analytics.breakPct}%` : '–'}</span>
+            <span class="kpi-lbl">Break ({analytics.breakWon}/{analytics.breakTotal})</span>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.attackEfficiency !== null ? `${analytics.attackEfficiency}%` : '–'}</span>
+            <span class="kpi-lbl">Angr.-Eff. ({analytics.kills}K / {analytics.attackErrors + analytics.attackBlocked}E)</span>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.aces}</span>
+            <span class="kpi-lbl">Asse</span>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.blocks}</span>
+            <span class="kpi-lbl">Kill Blocks</span>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.ownErrors}</span>
+            <span class="kpi-lbl">Eig. Fehler</span>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-num">{analytics.passAvgFormatted}</span>
+            <span class="kpi-lbl">
+              Ø Annahme ({analytics.passCount})
+              {#if analytics.passPositivePct !== null}
+                · +{analytics.passPositivePct}%
+              {/if}
+            </span>
+          </div>
         </div>
-        <div class="kpi-box">
-          <span class="kpi-num">{detailKpis.kills}</span>
-          <span class="kpi-lbl">Kills</span>
-        </div>
-        <div class="kpi-box">
-          <span class="kpi-num">{detailKpis.blocks}</span>
-          <span class="kpi-lbl">Kill Blocks</span>
-        </div>
-        <div class="kpi-box">
-          <span class="kpi-num">{detailKpis.ownErrors}</span>
-          <span class="kpi-lbl">Eig. Fehler</span>
-        </div>
-        <div class="kpi-box">
-          <span class="kpi-num">{detailKpis.sideouts}</span>
-          <span class="kpi-lbl">Side-outs</span>
-        </div>
-        <div class="kpi-box">
-          <span class="kpi-num">{detailKpis.passAvg}</span>
-          <span class="kpi-lbl">Ø Annahme ({detailKpis.passCount})</span>
-        </div>
-      </div>
 
-      <div class="detail-columns">
-        <!-- LINKE SPALTE: SPIELER-SCORECARD & ROTATIONS-ANALYSE -->
-        <div class="detail-col">
-          <section class="panel-card">
-            <h3 class="panel-title">Spieler-Statistik</h3>
-            {#if playerStats.length === 0}
-              <p class="muted-note">Keine spielerbezogenen Kontakte in dieser Auswahl erfasst.</p>
-            {:else}
-              <div class="table-wrap">
-                <table class="stat-table">
-                  <thead>
-                    <tr>
-                      <th>Spieler/in</th>
-                      <th>Kills</th>
-                      <th>Asse</th>
-                      <th>Blk</th>
-                      <th>Fehl.</th>
-                      <th>Ø Ann.</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {#each playerStats as ps (ps.player)}
+        <div class="detail-columns">
+          <!-- LINKE SPALTE: SPIELER-SCORECARD & ROTATIONS-ANALYSE -->
+          <div class="detail-col">
+            <section class="panel-card">
+              <h3 class="panel-title">Spieler-Statistik</h3>
+              {#if analytics.playerStats.length === 0}
+                <p class="muted-note">Keine spielerbezogenen Kontakte in dieser Auswahl erfasst.</p>
+              {:else}
+                <div class="table-wrap">
+                  <table class="stat-table">
+                    <thead>
                       <tr>
-                        <td class="player-cell">{ps.player}</td>
-                        <td>{ps.kills}</td>
-                        <td>{ps.aces}</td>
-                        <td>{ps.blocks}</td>
-                        <td class="err-cell">{ps.errors}</td>
-                        <td>
-                          {ps.passCount > 0 ? `${(ps.passSum / ps.passCount).toFixed(2)} (${ps.passCount})` : '–'}
-                        </td>
+                        <th>Spieler/in</th>
+                        <th>Kills</th>
+                        <th>Asse</th>
+                        <th>Blk</th>
+                        <th>Dig</th>
+                        <th>Fehl.</th>
+                        <th>Ø Ann.</th>
                       </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              </div>
-            {/if}
-          </section>
-
-          <section class="panel-card">
-            <h3 class="panel-title">Rotations-Bilanz (Läufer R1–R6)</h3>
-            <div class="rot-grid">
-              {#each rotationStats as rs (rs.rot)}
-                <div class="rot-card" class:pos={rs.diff > 0} class:neg={rs.diff < 0}>
-                  <span class="rot-name">R{rs.rot}</span>
-                  <span class="rot-diff">{rs.diff > 0 ? `+${rs.diff}` : rs.diff}</span>
-                  <span class="rot-sub">+{rs.won} / −{rs.lost}</span>
+                    </thead>
+                    <tbody>
+                      {#each analytics.playerStats as ps (ps.player)}
+                        <tr>
+                          <td class="player-cell">{ps.player}</td>
+                          <td>{ps.kills}</td>
+                          <td>{ps.aces}</td>
+                          <td>{ps.blocks}</td>
+                          <td>{ps.digs}</td>
+                          <td class="err-cell">{ps.errors}</td>
+                          <td>
+                            {ps.passCount > 0 ? `${(ps.passSum / ps.passCount).toFixed(2)} (${ps.passCount})` : '–'}
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
                 </div>
-              {/each}
-            </div>
-          </section>
-        </div>
+              {/if}
+            </section>
+
+            <section class="panel-card">
+              <h3 class="panel-title">Rotations-Bilanz (Läufer R1–R6)</h3>
+              <div class="rot-grid">
+                {#each analytics.rotationStats as rs (rs.rot)}
+                  <div class="rot-card" class:pos={rs.diff > 0} class:neg={rs.diff < 0}>
+                    <span class="rot-name">R{rs.rot}</span>
+                    <span class="rot-diff">{rs.diff > 0 ? `+${rs.diff}` : rs.diff}</span>
+                    <span class="rot-sub">+{rs.won} / −{rs.lost}</span>
+                    <span class="rot-so">
+                      SO {rs.sideoutPct !== null ? `${rs.sideoutPct}%` : '–'}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            </section>
+          </div>
 
         <!-- RECHTE SPALTE: VOLLSTÄNDIGER SPIELVERLAUF -->
         <section class="panel-card">
@@ -658,6 +715,7 @@
           {/if}
         </section>
       </div>
+      {/if}
     {/if}
   </div>
 </div>
@@ -1454,5 +1512,115 @@
     font-size: 0.88rem;
     font-weight: 700;
     color: #0f172a;
+  }
+
+  .local-archive-sec {
+    margin-bottom: 18px;
+  }
+
+  .local-sec-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+
+  .local-sec-title {
+    margin: 0;
+    font-size: 0.96rem;
+    font-weight: 900;
+    color: #0f172a;
+  }
+
+  .local-sec-sub {
+    font-size: 0.78rem;
+    color: #64748b;
+    font-weight: 600;
+  }
+
+  .mc-badges-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .mc-local-pill {
+    font-size: 0.68rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+  }
+
+  .mc-del-btn {
+    border: 1px solid #fecaca;
+    background: #fff1f2;
+    color: #b91c1c;
+    border-radius: 6px;
+    width: 24px;
+    height: 24px;
+    font-size: 0.72rem;
+    font-weight: 900;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mc-del-btn:hover {
+    background: #fee2e2;
+  }
+
+  .dh-export-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid #f1f5f9;
+  }
+
+  .exp-btn {
+    border: 1px solid #cbd5e1;
+    background: #f8fafc;
+    color: #1e293b;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 0.78rem;
+    font-weight: 800;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+
+  .exp-btn:hover {
+    background: #f1f5f9;
+  }
+
+  .exp-btn.primary {
+    background: #0f172a;
+    border-color: #0f172a;
+    color: #ffffff;
+  }
+
+  .exp-btn.primary:hover {
+    background: #1e293b;
+  }
+
+  .exp-feedback {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #15803d;
+  }
+
+  .rot-so {
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: #475569;
   }
 </style>

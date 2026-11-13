@@ -1,72 +1,100 @@
 <script lang="ts">
-  import type { PlayerSelection, RotationPosition, FormationMode, ServingTeam } from './types';
+  import type {
+    PlayerSelection,
+    RotationPosition,
+    FormationMode,
+    ServingTeam,
+    SystemType,
+    PlayerSetup
+  } from './types';
   import ReceiveFormation from './ReceiveFormation.svelte';
+  import {
+    formatPlayerDisplay,
+    getIndexForCourtPos,
+    rotateClockwise
+  } from './matchEngine';
 
   interface Props {
-    myTeamLineup?: (string | any)[];
+    myTeamLineup?: PlayerSetup[];
     opponentLineup?: string[];
     currentRotation?: number;
     opponentRotation?: number;
     selectedPlayer?: PlayerSelection | null;
     onSelectPlayer?: (selection: PlayerSelection | null) => void;
     onRotationChange?: (rotation: number) => void;
+    onOpponentRotationChange?: (rotation: number) => void;
+    onOpponentLineupChange?: (lineup: string[]) => void;
     showOpponent?: boolean;
     myTeamName?: string;
     opponentName?: string;
+    system?: SystemType;
     formationMode?: FormationMode;
     onFormationChange?: (mode: FormationMode) => void;
     activeLiberoName?: string | null;
+    liberoCanServe?: boolean;
     servingTeam?: ServingTeam;
+    courtFlipped?: boolean;
   }
 
   let {
-    myTeamLineup = $bindable(["#1 (S)", "#2 (OH1)", "#3 (MB1)", "#4 (OPP)", "#5 (OH2)", "#6 (MB2)"]),
-    opponentLineup = $bindable(["#1", "#2", "#3", "#4", "#5", "#6"]),
+    myTeamLineup = $bindable<PlayerSetup[]>([]),
+    opponentLineup = $bindable<string[]>(['#1', '#2', '#3', '#4', '#5', '#6']),
     currentRotation = $bindable(1),
     opponentRotation = $bindable(1),
     selectedPlayer = $bindable(null),
     onSelectPlayer,
     onRotationChange,
+    onOpponentRotationChange,
+    onOpponentLineupChange,
     showOpponent = true,
-    myTeamName = "Mein Team",
-    opponentName = "Gegner",
+    myTeamName = 'Mein Team',
+    opponentName = 'Gegner',
+    system = '5-1',
     formationMode = $bindable<FormationMode>('base'),
     onFormationChange,
     activeLiberoName = 'L',
-    servingTeam = 'us'
+    liberoCanServe = false,
+    servingTeam = 'us',
+    courtFlipped = $bindable(false)
   }: Props = $props();
 
-  // Rotations-Formel für Uhrzeigersinn-Rotation (Läufer zählt herunter: 1 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1):
-  // playerIndex = (pos - rot + 6) % 6
-  // Inklusive automatischem FIVB Libero-Wechsel (L ersetzt MB1/MB2 im Hinterfeld Pos 1, 5, 6;
-  // im Vorderfeld Pos 2, 3, 4 wechselt L automatisch wieder mit MB1/MB2 zurück)
+  let editingOpponent = $state(false);
+
   function getPlayerAtPosition(
-    lineup: (string | any)[],
+    lineup: (string | PlayerSetup)[],
     pos: RotationPosition,
     rot: number,
     applyLiberoRule: boolean = true
   ) {
-    const playerIndex = (pos - rot + 6) % 6;
+    const playerIndex = getIndexForCourtPos(pos, rot);
     const item = lineup ? lineup[playerIndex] : undefined;
     let playerStr = `#${playerIndex + 1}`;
+    let playerNum: string | undefined;
     let roleStr = '';
+
     if (typeof item === 'string') {
       playerStr = item;
       const match = item.match(/\((MB1|MB2|MB)\)/i);
       if (match) roleStr = match[1].toUpperCase();
     } else if (item && typeof item === 'object') {
       roleStr = (item.role ?? '').toUpperCase();
-      playerStr = item.name ? (item.role ? `${item.name} (${item.role})` : item.name) : (item.role ?? `#${playerIndex + 1}`);
+      playerNum = item.number?.trim() || undefined;
+      playerStr = item.name
+        ? formatPlayerDisplay(item)
+        : (item.role ?? `#${playerIndex + 1}`);
     }
 
     const isBackRow = pos === 1 || pos === 5 || pos === 6;
+    const liberoAllowedOnPos = isBackRow && (pos !== 1 || servingTeam === 'them' || liberoCanServe);
     const isMB = roleStr === 'MB1' || roleStr === 'MB2' || roleStr === 'MB';
-    if (applyLiberoRule && isBackRow && isMB && activeLiberoName) {
+    if (applyLiberoRule && liberoAllowedOnPos && isMB && activeLiberoName) {
       playerStr = activeLiberoName === 'L' ? `L (für ${roleStr})` : `${activeLiberoName} (L)`;
+      playerNum = undefined;
     }
 
     return {
       player: playerStr,
+      playerNum,
       playerIndex
     };
   }
@@ -79,44 +107,80 @@
     return map;
   });
 
+  // Detect opponent setter position (if tagged with S, Z, (S), (Z), Zuspiel)
+  const opponentSetterHint = $derived.by<string | null>(() => {
+    for (const pos of [1, 2, 3, 4, 5, 6] as RotationPosition[]) {
+      const idx = getIndexForCourtPos(pos, opponentRotation);
+      const label = (opponentLineup[idx] ?? '').trim();
+      if (/\b(Z|S|Z1|Z2|S1|S2|Zuspiel)\b/i.test(label) || /\((Z|S|Z1|Z2|S1|S2)\)/i.test(label)) {
+        const isFront = pos === 2 || pos === 3 || pos === 4;
+        return isFront
+          ? `Z vorne (P${pos}) • 2 Angreifer`
+          : `Z hinten (P${pos}) • 3 Angreifer`;
+      }
+    }
+    return null;
+  });
+
   function handleNextRotation() {
-    // Im Volleyball rotiert man im Uhrzeigersinn (Läufer zählt herunter: 1 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1)
-    const nextRot = currentRotation === 1 ? 6 : currentRotation - 1;
+    const nextRot = rotateClockwise(currentRotation as RotationPosition);
     currentRotation = nextRot;
     onRotationChange?.(nextRot);
+    syncSelectedMyPlayer(nextRot);
+  }
 
-    // Wenn aktuell ein eigener Spieler ausgewählt ist, dessen Metadaten aktualisieren
-    if (selectedPlayer && selectedPlayer.team === 'myTeam') {
-      const { player, playerIndex } = getPlayerAtPosition(myTeamLineup, selectedPlayer.position, nextRot);
+  function handleNextOpponentRotation() {
+    const nextRot = rotateClockwise(opponentRotation as RotationPosition);
+    opponentRotation = nextRot;
+    onOpponentRotationChange?.(nextRot);
+    if (selectedPlayer && selectedPlayer.team === 'opponent') {
+      const { player, playerIndex } = getPlayerAtPosition(
+        opponentLineup,
+        selectedPlayer.position,
+        nextRot,
+        false
+      );
       selectedPlayer = {
         ...selectedPlayer,
         player,
         playerIndex,
-        rotation: nextRot
+        rotation: nextRot,
+        isServer: selectedPlayer.position === 1 && servingTeam === 'them'
       };
       onSelectPlayer?.(selectedPlayer);
     }
   }
 
-  function handlePrevRotation() {
-    // Rückwärts (gegen den Uhrzeigersinn: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 1)
-    const prevRot = (currentRotation % 6) + 1;
-    currentRotation = prevRot;
-    onRotationChange?.(prevRot);
-
+  function syncSelectedMyPlayer(rot: number) {
     if (selectedPlayer && selectedPlayer.team === 'myTeam') {
-      const { player, playerIndex } = getPlayerAtPosition(myTeamLineup, selectedPlayer.position, prevRot);
+      const { player, playerNum, playerIndex } = getPlayerAtPosition(
+        myTeamLineup,
+        selectedPlayer.position,
+        rot
+      );
       selectedPlayer = {
         ...selectedPlayer,
         player,
+        playerNum,
         playerIndex,
-        rotation: prevRot
+        rotation: rot,
+        isServer: selectedPlayer.position === 1 && servingTeam === 'us'
       };
       onSelectPlayer?.(selectedPlayer);
     }
+  }
+
+  function updateOpponentSlot(pos: RotationPosition, value: string) {
+    const idx = getIndexForCourtPos(pos, opponentRotation);
+    const next = [...opponentLineup];
+    next[idx] = value;
+    opponentLineup = next;
+    onOpponentLineupChange?.(next);
   }
 
   function handleSelect(team: 'myTeam' | 'opponent', position: RotationPosition) {
+    if (team === 'opponent' && editingOpponent) return;
+
     if (isSelected(team, position)) {
       selectedPlayer = null;
       onSelectPlayer?.(null);
@@ -125,8 +189,13 @@
 
     const rot = team === 'myTeam' ? currentRotation : opponentRotation;
     const lineup = team === 'myTeam' ? myTeamLineup : opponentLineup;
-    const { player, playerIndex } = getPlayerAtPosition(lineup, position, rot);
-    const row = (position === 2 || position === 3 || position === 4) ? 'front' : 'back';
+    const { player, playerNum, playerIndex } = getPlayerAtPosition(
+      lineup,
+      position,
+      rot,
+      team === 'myTeam'
+    );
+    const row = position === 2 || position === 3 || position === 4 ? 'front' : 'back';
     const isServer =
       position === 1 &&
       ((team === 'myTeam' && servingTeam === 'us') ||
@@ -136,6 +205,7 @@
       team,
       position,
       player,
+      playerNum,
       playerIndex,
       rotation: rot,
       row,
@@ -164,7 +234,6 @@
     setFormation(nextMode);
   }
 
-  // Position Metadaten für Tooltips und Barrierefreiheit
   const posLabels: Record<RotationPosition, string> = {
     1: 'Pos 1 (Hinten Rechts / Aufschlag)',
     2: 'Pos 2 (Vorne Rechts)',
@@ -174,6 +243,172 @@
     6: 'Pos 6 (Hinten Mitte)'
   };
 </script>
+
+{#snippet opponentHalfBlock(flipped: boolean)}
+  <section class="court-half opponent-half" aria-label="Gegnerische Feldhälfte">
+    <div class="half-header">
+      <div class="half-title-group">
+        <span class="badge opponent-badge">{opponentName}</span>
+        {#if opponentSetterHint}
+          <span class="opp-setter-pill">{opponentSetterHint}</span>
+        {/if}
+      </div>
+
+      <div class="opp-controls">
+        <button
+          type="button"
+          class="opp-ctrl-btn"
+          onclick={handleNextOpponentRotation}
+          title="Gegner-Rotation weiterrücken (↻)"
+        >
+          R{opponentRotation} ↻
+        </button>
+        <button
+          type="button"
+          class="opp-ctrl-btn"
+          class:active={editingOpponent}
+          onclick={() => (editingOpponent = !editingOpponent)}
+          title="Gegner-Positionen beschriften (z.B. #12 Z, #7 AA)"
+        >
+          {editingOpponent ? 'Fertig' : '✎ Notiz'}
+        </button>
+      </div>
+    </div>
+
+    {#if editingOpponent}
+      <p class="opp-edit-hint">
+        Kürzel eintragen (Tipp: <strong>Z</strong> oder <strong>S</strong> markiert Zuspieler für 2/3-Angreifer-Warnung):
+      </p>
+    {/if}
+
+    {#if !flipped}
+      <!-- Standard: Rückraum oben [1, 6, 5], Vorderzone unten [2, 3, 4] -->
+      <div class="grid-section back-row">
+        {#each [1, 6, 5] as const as pos}
+          {@render opponentPosBox(pos)}
+        {/each}
+      </div>
+      <div class="attack-line" aria-hidden="true"><span class="line-label"></span></div>
+      <div class="grid-section front-row">
+        {#each [2, 3, 4] as const as pos}
+          {@render opponentPosBox(pos, true)}
+        {/each}
+      </div>
+    {:else}
+      <!-- Gespiegelt (Seitenwechsel): Vorderzone oben am Netz [4, 3, 2], Rückraum unten [5, 6, 1] -->
+      <div class="grid-section front-row">
+        {#each [4, 3, 2] as const as pos}
+          {@render opponentPosBox(pos, true)}
+        {/each}
+      </div>
+      <div class="attack-line" aria-hidden="true"><span class="line-label"></span></div>
+      <div class="grid-section back-row">
+        {#each [5, 6, 1] as const as pos}
+          {@render opponentPosBox(pos)}
+        {/each}
+      </div>
+    {/if}
+  </section>
+{/snippet}
+
+{#snippet opponentPosBox(pos: RotationPosition, isFront: boolean = false)}
+  {@const idx = getIndexForCourtPos(pos, opponentRotation)}
+  {@const { player } = getPlayerAtPosition(opponentLineup, pos, opponentRotation, false)}
+  {@const isOppServerPos = pos === 1 && servingTeam === 'them'}
+  {#if editingOpponent}
+    <div class="pos-box opponent-box editing" class:front={isFront} class:server-box={isOppServerPos}>
+      <span class="pos-badge" class:server-badge={isOppServerPos}>P{pos}</span>
+      <input
+        type="text"
+        class="opp-inline-input"
+        value={opponentLineup[idx] ?? `#${idx + 1}`}
+        oninput={(e) => updateOpponentSlot(pos, e.currentTarget.value)}
+        placeholder={`#${idx + 1}`}
+        aria-label={`Gegner Position ${pos}`}
+      />
+    </div>
+  {:else}
+    <button
+      type="button"
+      class="pos-box opponent-box"
+      class:front={isFront}
+      class:server-box={isOppServerPos}
+      class:selected={isSelected('opponent', pos)}
+      onclick={() => handleSelect('opponent', pos)}
+      aria-label={`Gegner ${posLabels[pos]}: ${player}${isOppServerPos ? ' (Aufschlag)' : ''}`}
+      aria-pressed={isSelected('opponent', pos)}
+    >
+      <span class="pos-badge" class:server-badge={isOppServerPos}>P{pos}</span>
+      <span class="player-name">{player}</span>
+      {#if isOppServerPos}
+        <div class="serve-indicator" title="Gegnerischer Aufschlag">
+          <span class="serve-text">AUFSCHLAG</span>
+        </div>
+      {/if}
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet myHalfBlock(flipped: boolean)}
+  <section class="court-half my-half" aria-label="Eigene Feldhälfte">
+    <div class="half-header">
+      <span class="badge my-badge">{myTeamName}</span>
+      <span class="half-hint">{flipped ? 'Rückraum oben • Netz unten' : 'Netz oben • Rückraum unten'}</span>
+    </div>
+
+    {#if !flipped}
+      <div class="grid-section front-row">
+        {#each [4, 3, 2] as const as pos}
+          {@render myPosBox(pos, true)}
+        {/each}
+      </div>
+      <div class="attack-line" aria-hidden="true"><span class="line-label"></span></div>
+      <div class="grid-section back-row">
+        {#each [5, 6, 1] as const as pos}
+          {@render myPosBox(pos, false)}
+        {/each}
+      </div>
+    {:else}
+      <div class="grid-section back-row">
+        {#each [1, 6, 5] as const as pos}
+          {@render myPosBox(pos, false)}
+        {/each}
+      </div>
+      <div class="attack-line" aria-hidden="true"><span class="line-label"></span></div>
+      <div class="grid-section front-row">
+        {#each [2, 3, 4] as const as pos}
+          {@render myPosBox(pos, true)}
+        {/each}
+      </div>
+    {/if}
+  </section>
+{/snippet}
+
+{#snippet myPosBox(pos: RotationPosition, isFront: boolean)}
+  {@const { player } = getPlayerAtPosition(myTeamLineup, pos, currentRotation)}
+  {@const isServerPos = pos === 1 && servingTeam === 'us'}
+  <button
+    type="button"
+    class="pos-box my-box"
+    class:front={isFront}
+    class:back={!isFront}
+    class:server-box={isServerPos}
+    class:selected={isSelected('myTeam', pos)}
+    onclick={() => handleSelect('myTeam', pos)}
+    aria-label={`${myTeamName} ${posLabels[pos]}: ${player}${isServerPos ? ' (Aufschlag)' : ''}`}
+    aria-pressed={isSelected('myTeam', pos)}
+  >
+    <span class="pos-badge" class:server-badge={isServerPos}>P{pos}</span>
+    <span class="player-name">{player}</span>
+    {#if isServerPos}
+      <div class="serve-indicator" title="Aufschlagender Spieler">
+        <span class="serve-text">AUFSCHLAG</span>
+      </div>
+    {:else}
+      <span class="zone-tag">{isFront ? 'Vorne' : 'Hinten'}</span>
+    {/if}
+  </button>
+{/snippet}
 
 <div class="court-wrapper">
   <!-- FORMATIONS-SWITCHER (HAUPTTOGGLE: GRUNDPOSITION vs ANNAHME-RIEGEL) -->
@@ -198,72 +433,52 @@
         aria-selected={formationMode === 'receive'}
         onclick={() => setFormation('receive')}
       >
-        <span class="tab-label">Annahme-Aufstellung</span>
+        <span class="tab-label">Annahme ({system})</span>
       </button>
+    </div>
+
+    {#if formationMode === 'base' && showOpponent}
+      <button
+        type="button"
+        class="flip-btn"
+        class:active={courtFlipped}
+        onclick={() => (courtFlipped = !courtFlipped)}
+        title="Seitenwechsel: Spielfeld-Ansicht um 180° drehen"
+        aria-label="Seitenwechsel umschalten"
+        aria-pressed={courtFlipped}
+      >
+        ⇅
+      </button>
+    {:else}
+      <button
+        type="button"
+        class="quick-toggle-btn"
+        onclick={toggleFormation}
+        title="Zwischen Grundaufstellung und Annahme-Riegel wechseln"
+        aria-label="Formation umschalten"
+      >
+        ⇄
+      </button>
+    {/if}
+
+    <div class="rotation-badge">
+      <span class="rot-title">Rot.</span>
+      <span class="rot-value">{currentRotation}</span>
     </div>
 
     <button
       type="button"
-      class="quick-toggle-btn"
-      onclick={toggleFormation}
-      title="Zwischen Grundaufstellung und Annahme-Riegel wechseln"
-      aria-label="Formation umschalten"
+      class="rot-btn prev"
+      onclick={handleNextRotation}
+      aria-label="Nächste Rotation (im Uhrzeigersinn)"
+      title="Nächste Rotation (im Uhrzeigersinn)"
     >
-      ⇄
+      <span class="icon">↻</span>
     </button>
-
-
-      <div class="rotation-badge">
-        <span class="rot-title">Rot.</span>
-        <span class="rot-value">{currentRotation}</span>
-      </div>
-
-	<button 
-	type="button" 
-	class="rot-btn prev" 
-	onclick={handleNextRotation}
-	aria-label="Nächste Rotation (im Uhrzeigersinn)"
-	title="Nächste Rotation (im Uhrzeigersinn)"
-	>
-	<span class="icon">↻</span>
-	<!--<span class="label"></span> -->
-	</button>
   </div>
 
-  <!-- ROTATION BAR & SCHNELLWAHL -->
-
+  <!-- QUICK ROTATION PILL STRIP (1 BIS 6) -->
   <header class="court-header">
-  <!--
-    <div class="rotation-control">
-      <button 
-        type="button"
-        class="rot-btn prev"
-        onclick={handlePrevRotation}
-        aria-label="Vorherige Rotation"
-        title="Vorherige Rotation"
-      >
-        ↺
-      </button>
-
-      <div class="rotation-badge">
-        <span class="rot-title">Rotation</span>
-        <span class="rot-value">{currentRotation}</span>
-      </div>
-
-      <button 
-        type="button" 
-        class="rot-btn next" 
-        onclick={handleNextRotation}
-        aria-label="Nächste Rotation (im Uhrzeigersinn)"
-        title="Nächste Rotation (im Uhrzeigersinn)"
-      >
-        <span class="icon">↻</span>
-        <span class="label">Nächste Rotation</span>
-      </button>
-    </div> 
-	-->
-
-    <!-- Quick Rotation Pill Strip (1 bis 6) -->
     <div class="rotation-pills" role="radiogroup" aria-label="Rotation direkt wählen">
       {#each [1, 2, 3, 4, 5, 6] as rot}
         <button
@@ -273,11 +488,7 @@
           onclick={() => {
             currentRotation = rot;
             onRotationChange?.(rot);
-            if (selectedPlayer && selectedPlayer.team === 'myTeam') {
-              const { player, playerIndex } = getPlayerAtPosition(myTeamLineup, selectedPlayer.position, rot);
-              selectedPlayer = { ...selectedPlayer, player, playerIndex, rotation: rot };
-              onSelectPlayer?.(selectedPlayer);
-            }
+            syncSelectedMyPlayer(rot);
           }}
           aria-label={`Rotation ${rot}`}
           aria-checked={currentRotation === rot}
@@ -291,155 +502,56 @@
 
   <!-- ANZEIGE DES FELDES -->
   {#if formationMode === 'receive'}
-    <div class="svg-court-wrapper" role="region" aria-label="5-1 Annahme und Transition">
+    <div class="svg-court-wrapper" role="region" aria-label={`${system} Annahme und Transition`}>
       <ReceiveFormation
         bind:currentRotation
         playerNames={activeCourtPlayerNames}
         hasLibero={Boolean(activeLiberoName)}
+        courtPlayers={myTeamLineup}
+        {system}
+        selectedPosition={selectedPlayer?.team === 'myTeam' ? selectedPlayer.position : null}
+        onSelectPosition={(pos) => handleSelect('myTeam', pos)}
       />
     </div>
   {:else}
-    <!-- ═════════════════════════════════════════════════════════════ -->
-    <!-- KLASSISCHES SPIELFELD (GRUNDAUFSTELLUNG)                      -->
-    <!-- ═════════════════════════════════════════════════════════════ -->
     <div class="court-card" role="region" aria-label="Volleyball Spielfeld">
-      
-      {#if showOpponent}
-        <!-- GEGNER HÄLFTE (OBEN) -->
-        <section class="court-half opponent-half" aria-label="Gegnerische Feldhälfte">
-          <div class="half-header">
-            <span class="badge opponent-badge">
-              {opponentName}
-            </span>
-            <span class="half-hint">Rückraum oben • Netz unten</span>
-          </div>
+      {#if !courtFlipped}
+        {#if showOpponent}
+          {@render opponentHalfBlock(false)}
+        {/if}
 
-          <div class="grid-section back-row">
-            <!-- Gegner Hinterzone (180° gedreht, Blick zum Netz): Pos 1 (Links oben / Aufschlag), Pos 6 (Mitte), Pos 5 (Rechts oben) -->
-            {#each [1, 6, 5] as const as pos}
-              {@const { player } = getPlayerAtPosition(opponentLineup, pos, opponentRotation)}
-              {@const isOppServerPos = pos === 1 && servingTeam === 'them'}
-              <button
-                type="button"
-                class="pos-box opponent-box"
-                class:server-box={isOppServerPos}
-                class:selected={isSelected('opponent', pos)}
-                onclick={() => handleSelect('opponent', pos)}
-                aria-label={`Gegner ${posLabels[pos]}: ${player}${isOppServerPos ? ' (Aufschlag)' : ''}`}
-                aria-pressed={isSelected('opponent', pos)}
-              >
-                <span class="pos-badge" class:server-badge={isOppServerPos}>P{pos}</span>
-                <span class="player-name">{player}</span>
-                {#if isOppServerPos}
-                  <div class="serve-indicator" title="Gegnerischer Aufschlag">
-                    <span class="serve-text">SERVE</span>
-                  </div>
-                {/if}
-              </button>
-            {/each}
+        <div class="net-separator" aria-label="Netzlinie">
+          <div class="antenna left" aria-hidden="true" title="Antenne Links"></div>
+          <div class="net-band">
+            <span class="net-mesh" aria-hidden="true">══════</span>
+            <span class="net-title">NETZ</span>
+            <span class="net-mesh" aria-hidden="true">══════</span>
           </div>
+          <div class="antenna right" aria-hidden="true" title="Antenne Rechts"></div>
+        </div>
 
-          <!-- 3-Meter Angriffslinie (Gegner) -->
-          <div class="attack-line" aria-hidden="true">
-            <span class="line-label"></span>
-          </div>
+        {@render myHalfBlock(false)}
+      {:else}
+        {@render myHalfBlock(true)}
 
-          <div class="grid-section front-row">
-            <!-- Gegner Vorderzone am Netz (180° gedreht): Pos 2 (Links / ggü. P4), Pos 3 (Mitte / ggü. P3), Pos 4 (Rechts / ggü. P2) -->
-            {#each [2, 3, 4] as const as pos}
-              {@const { player } = getPlayerAtPosition(opponentLineup, pos, opponentRotation)}
-              <button
-                type="button"
-                class="pos-box opponent-box front"
-                class:selected={isSelected('opponent', pos)}
-                onclick={() => handleSelect('opponent', pos)}
-                aria-label={`Gegner ${posLabels[pos]}: ${player}`}
-                aria-pressed={isSelected('opponent', pos)}
-              >
-                <span class="pos-badge">P{pos}</span>
-                <span class="player-name">{player}</span>
-              </button>
-            {/each}
+        <div class="net-separator" aria-label="Netzlinie">
+          <div class="antenna left" aria-hidden="true" title="Antenne Links"></div>
+          <div class="net-band">
+            <span class="net-mesh" aria-hidden="true">══════</span>
+            <span class="net-title">NETZ</span>
+            <span class="net-mesh" aria-hidden="true">══════</span>
           </div>
-        </section>
+          <div class="antenna right" aria-hidden="true" title="Antenne Rechts"></div>
+        </div>
+
+        {#if showOpponent}
+          {@render opponentHalfBlock(true)}
+        {/if}
       {/if}
-
-      <!-- DAS NETZ (TRENNLINIE MIT ANTENNEN) -->
-      <div class="net-separator" aria-label="Netzlinie">
-        <div class="antenna left" aria-hidden="true" title="Antenne Links"></div>
-        <div class="net-band">
-          <span class="net-mesh" aria-hidden="true">══════</span>
-          <span class="net-title">NETZ</span>
-          <span class="net-mesh" aria-hidden="true">══════</span>
-        </div>
-        <div class="antenna right" aria-hidden="true" title="Antenne Rechts"></div>
-      </div>
-
-      <!-- MEIN TEAM HÄLFTE (UNTEN) -->
-      <section class="court-half my-half" aria-label="Eigene Feldhälfte">
-        <!-- MODUS: REGULÄRE GRUNDAUFSTELLUNG (2x3 GRID) -->
-        <div class="half-header">
-          <span class="badge my-badge">{myTeamName}</span>
-          <span class="half-hint">Netz oben • Rückraum unten</span>
-        </div>
-
-        <div class="grid-section front-row">
-          {#each [4, 3, 2] as const as pos}
-            {@const { player } = getPlayerAtPosition(myTeamLineup, pos, currentRotation)}
-            <button
-              type="button"
-              class="pos-box my-box front"
-              class:selected={isSelected('myTeam', pos)}
-              onclick={() => handleSelect('myTeam', pos)}
-              aria-label={`${myTeamName} ${posLabels[pos]}: ${player}`}
-              aria-pressed={isSelected('myTeam', pos)}
-            >
-              <span class="pos-badge">P{pos}</span>
-              <span class="player-name">{player}</span>
-              <span class="zone-tag">Vorne</span>
-            </button>
-          {/each}
-        </div>
-
-        <div class="attack-line" aria-hidden="true">
-          <span class="line-label"></span>
-        </div>
-
-        <div class="grid-section back-row">
-          {#each [5, 6, 1] as const as pos}
-            {@const { player } = getPlayerAtPosition(myTeamLineup, pos, currentRotation)}
-            {@const isServerPos = pos === 1 && servingTeam === 'us'}
-            <button
-              type="button"
-              class="pos-box my-box back"
-              class:server-box={isServerPos}
-              class:selected={isSelected('myTeam', pos)}
-              onclick={() => handleSelect('myTeam', pos)}
-              aria-label={`${myTeamName} ${posLabels[pos]}: ${player}${isServerPos ? ' (Aufschlag)' : ''}`}
-              aria-pressed={isSelected('myTeam', pos)}
-            >
-              <span class="pos-badge" class:server-badge={isServerPos}>
-                P{pos}
-              </span>
-
-              <span class="player-name">{player}</span>
-
-              {#if isServerPos}
-                <div class="serve-indicator" title="Aufschlagender Spieler">
-                  <span class="serve-text">SERVE</span>
-                </div>
-              {:else}
-                <span class="zone-tag">Hinten</span>
-              {/if}
-            </button>
-          {/each}
-        </div>
-      </section>
-
     </div>
   {/if}
 
-  <!-- AKTIVER SPIELER STATUS-BANNER (FÜR SCHNELLES TOUCH-FEEDBACK) -->
+  <!-- AKTIVER SPIELER STATUS-BANNER -->
   {#if selectedPlayer}
     <div class="active-player-banner" role="status">
       <div class="banner-left">
@@ -477,7 +589,7 @@
   .court-wrapper {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 10px;
     width: 100%;
     max-width: 480px;
     margin: 0 auto;
@@ -490,7 +602,7 @@
   @media (min-width: 600px) {
     .court-wrapper {
       max-width: 580px;
-      gap: 14px;
+      gap: 12px;
     }
   }
 
@@ -500,20 +612,20 @@
     }
   }
 
-  /* Kompaktere vertikale Abstände im Querformat (iPad Mini Landscape & 16:9 / 16:10 Laptops) */
   @media (orientation: landscape) and (max-height: 880px) {
     .court-wrapper {
       gap: 8px;
     }
     .tab-btn,
     .quick-toggle-btn,
+    .flip-btn,
     .rot-btn,
     .rotation-badge {
       min-height: 42px;
     }
     .pill-btn {
-      min-height: 38px;
-      font-size: 0.95rem;
+      min-height: 36px;
+      font-size: 0.92rem;
     }
     .court-half {
       padding: 6px 8px;
@@ -527,11 +639,10 @@
     }
   }
 
-  /* --- FORMATIONS-SWITCHER (TABS & SCHNELLTASTE) --- */
   .formation-switch-container {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     width: 100%;
   }
 
@@ -546,7 +657,7 @@
   }
 
   .tab-btn {
-    min-height: 48px;
+    min-height: 46px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -554,12 +665,13 @@
     background: transparent;
     border: none;
     border-radius: 9px;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
     font-weight: 700;
     color: #475569;
     cursor: pointer;
     touch-action: manipulation;
     transition: all 0.15s ease;
+    padding: 0 6px;
   }
 
   .tab-btn:hover {
@@ -576,14 +688,15 @@
     color: #065f46;
   }
 
-  .quick-toggle-btn {
-    min-width: 48px;
-    min-height: 48px;
+  .quick-toggle-btn,
+  .flip-btn {
+    min-width: 44px;
+    min-height: 46px;
     background-color: #0f172a;
     color: #ffffff;
     border: none;
-    border-radius: 12px;
-    font-size: 1.25rem;
+    border-radius: 10px;
+    font-size: 1.15rem;
     font-weight: bold;
     cursor: pointer;
     display: flex;
@@ -593,15 +706,18 @@
     transition: transform 0.1s ease, background-color 0.15s ease;
   }
 
-  .quick-toggle-btn:hover {
-    background-color: #1e293b;
+  .flip-btn {
+    background-color: #f1f5f9;
+    color: #334155;
+    border: 1.5px solid #cbd5e1;
   }
 
-  .quick-toggle-btn:active {
-    transform: scale(0.95);
+  .flip-btn.active {
+    background-color: #0f172a;
+    color: #ffffff;
+    border-color: #0f172a;
   }
 
-  /* --- HEADER & ROTATIONS-STEUERUNG --- */
   .court-header {
     display: flex;
     flex-direction: column;
@@ -610,39 +726,24 @@
   }
 
   .rot-btn {
-    min-height: 48px;
+    min-height: 46px;
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    font-size: 1rem;
-    font-weight: 700;
     border-radius: 10px;
     border: none;
     cursor: pointer;
     touch-action: manipulation;
-    transition: transform 0.1s ease, background-color 0.15s ease, box-shadow 0.15s ease;
-  }
-
-  .rot-btn:active {
-    transform: scale(0.97);
   }
 
   .rot-btn.prev {
-    width: 48px;
-    background-color: #e2e8f0;
-    /*color: #1e293b;*/
+    width: 44px;
     color: #ffffff;
     background: linear-gradient(135deg, #2563eb, #1d4ed8);
-    /*font-size: 1.3rem;*/
-  }
-
-  .rot-btn.prev:hover {
-    background-color: #cbd5e1;
   }
 
   .rot-btn .icon {
-    font-size: 1.25rem;
+    font-size: 1.2rem;
     line-height: 1;
   }
 
@@ -651,8 +752,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    /*min-width: 70px;*/
-    min-height: 48px;
+    min-height: 46px;
     background-color: #0f172a;
     color: #f8fafc;
     border-radius: 10px;
@@ -661,7 +761,7 @@
   }
 
   .rot-title {
-    font-size: 0.65rem;
+    font-size: 0.62rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: #94a3b8;
@@ -670,13 +770,12 @@
   }
 
   .rot-value {
-    font-size: 1.2rem;
+    font-size: 1.15rem;
     font-weight: 800;
     color: #38bdf8;
     line-height: 1;
   }
 
-  /* Quick Pill Selector */
   .rotation-pills {
     display: grid;
     grid-template-columns: repeat(6, 1fr);
@@ -685,12 +784,12 @@
   }
 
   .pill-btn {
-    min-height: 48px;
+    min-height: 44px;
     background-color: #f1f5f9;
     border: 1px solid #cbd5e1;
     border-radius: 8px;
     font-weight: 700;
-    font-size: 1.05rem;
+    font-size: 1rem;
     color: #334155;
     cursor: pointer;
     touch-action: manipulation;
@@ -708,7 +807,6 @@
     box-shadow: 0 2px 4px rgba(37, 99, 235, 0.35);
   }
 
-  /* --- SVG COURT WRAPPER --- */
   .svg-court-wrapper {
     width: 100%;
     border: 3px solid #0f172a;
@@ -720,7 +818,6 @@
     box-sizing: border-box;
   }
 
-  /* --- SPIELFELD-CONTAINER (KLASSISCH) --- */
   .court-card {
     width: 100%;
     background-color: #ffffff;
@@ -748,11 +845,62 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 6px;
     margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
+
+  .half-title-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .opp-setter-pill {
+    font-size: 0.65rem;
+    font-weight: 800;
+    color: #9f1239;
+    background: #ffffff;
+    border: 1px solid #fda4af;
+    border-radius: 9999px;
+    padding: 1px 7px;
+  }
+
+  .opp-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .opp-ctrl-btn {
+    padding: 2px 7px;
+    font-size: 0.68rem;
+    font-weight: 800;
+    border-radius: 6px;
+    border: 1px solid #fda4af;
+    background: #ffffff;
+    color: #9f1239;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+
+  .opp-ctrl-btn.active {
+    background: #be123c;
+    border-color: #be123c;
+    color: #ffffff;
+  }
+
+  .opp-edit-hint {
+    margin: 0 0 6px;
+    font-size: 0.68rem;
+    color: #881337;
+    font-weight: 600;
   }
 
   .badge {
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -778,42 +926,26 @@
     font-weight: 500;
   }
 
-  /* 3-Spalten Grid für Grundaufstellung */
   .grid-section {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 6px;
   }
 
-  /* 3-Meter Angriffslinie */
   .attack-line {
     margin: 6px 0;
     display: flex;
     align-items: center;
     justify-content: center;
     border-top: 2px dashed rgba(15, 23, 42, 0.35);
-    height: 10px;
+    height: 8px;
     position: relative;
   }
 
-  .line-label {
-    position: absolute;
-    top: -6px;
-    background-color: rgba(255, 255, 255, 0.85);
-    padding: 0 6px;
-    font-size: 0.55rem;
-    font-weight: 700;
-    color: #64748b;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    border-radius: 4px;
-  }
-
-  /* --- DAS NETZ --- */
   .net-separator {
     display: flex;
     align-items: center;
-    height: 24px;
+    height: 22px;
     background-color: #090d16;
     color: #ffffff;
     position: relative;
@@ -862,9 +994,8 @@
     letter-spacing: 0.1em;
   }
 
-  /* --- SPIELER BOXEN (TOUCH TARGETS) --- */
   .pos-box {
-    min-height: 54px;
+    min-height: 52px;
     padding: 6px 4px;
     background-color: #ffffff;
     border: 2px solid #cbd5e1;
@@ -881,9 +1012,27 @@
     text-align: center;
   }
 
+  .pos-box.editing {
+    cursor: default;
+    padding-top: 16px;
+  }
+
+  .opp-inline-input {
+    width: 90%;
+    padding: 3px 4px;
+    border: 1.5px solid #f43f5e;
+    border-radius: 5px;
+    font-size: 0.78rem;
+    font-weight: 800;
+    text-align: center;
+    color: #0f172a;
+    background: #ffffff;
+    box-sizing: border-box;
+  }
+
   @media (min-width: 600px) and (min-height: 800px) {
     .pos-box {
-      min-height: 64px;
+      min-height: 62px;
       padding: 8px 6px;
     }
   }
@@ -892,7 +1041,7 @@
     border-color: #64748b;
   }
 
-  .pos-box:active {
+  .pos-box:active:not(.editing) {
     transform: scale(0.96);
   }
 
@@ -900,7 +1049,7 @@
     position: absolute;
     top: 3px;
     left: 4px;
-    font-size: 0.65rem;
+    font-size: 0.62rem;
     font-weight: 800;
     color: #64748b;
     background-color: #f1f5f9;
@@ -910,7 +1059,7 @@
   }
 
   .player-name {
-    font-size: 0.95rem;
+    font-size: 0.88rem;
     font-weight: 800;
     color: #0f172a;
     line-height: 1.15;
@@ -927,7 +1076,6 @@
     line-height: 1;
   }
 
-  /* Spezifische Stylings für eigenes Team & Gegner */
   .opponent-box {
     border-color: #fca5a5;
   }
@@ -946,7 +1094,6 @@
     background-color: #f8fbff;
   }
 
-  /* Aufschlag-Position 1 (Aktives Aufschlagrecht auf Mein Team oder Gegner) */
   .pos-box.server-box {
     border: 2px solid #16a34a;
     background: linear-gradient(180deg, #f0fdf4 0%, #dcfce7 100%);
@@ -964,9 +1111,9 @@
     gap: 3px;
     background-color: #15803d;
     color: #ffffff;
-    font-size: 0.6rem;
+    font-size: 0.55rem;
     font-weight: 800;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.04em;
     padding: 1px 5px;
     border-radius: 9999px;
     margin-top: 2px;
@@ -988,7 +1135,6 @@
     }
   }
 
-  /* --- AKTIVER / AUSGEWÄHLTER SPIELER (SELECTION HIGHLIGHT) --- */
   .pos-box.selected {
     border: 3px solid #d97706 !important;
     background-color: #fffbeb !important;
@@ -1006,12 +1152,11 @@
     color: #78350f !important;
   }
 
-  /* --- BANNER FÜR AKTIVEN SPIELER --- */
   .active-player-banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    min-height: 48px;
+    min-height: 46px;
     background-color: #1e293b;
     color: #ffffff;
     padding: 8px 14px;
@@ -1025,6 +1170,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
   }
 
   .status-dot {
@@ -1032,25 +1178,24 @@
     height: 10px;
     background-color: #f59e0b;
     border-radius: 50%;
-    animation: blink 1.2s infinite ease-in-out;
-  }
-
-  @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+    flex-shrink: 0;
   }
 
   .banner-team {
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     font-weight: 700;
     color: #94a3b8;
     text-transform: uppercase;
+    white-space: nowrap;
   }
 
   .banner-player {
-    font-size: 1.05rem;
+    font-size: 1rem;
     font-weight: 800;
     color: #f8fafc;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .banner-right {
@@ -1058,6 +1203,7 @@
     flex-direction: column;
     align-items: flex-end;
     gap: 1px;
+    flex-shrink: 0;
   }
 
   .banner-pos {

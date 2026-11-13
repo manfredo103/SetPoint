@@ -1,7 +1,11 @@
-import type { SavedMatchSummary, VolleyballMatchPayload } from './types';
+import type { SavedMatchSummary, TeamPreset, VolleyballMatchPayload } from './types';
 
-const OUTBOX_STORAGE_KEY = 'volleyball_outbox_v1';
-const API_KEY_STORAGE_KEY = 'volleyball_api_key_v1';
+export const OUTBOX_STORAGE_KEY = 'volleyball_outbox_v1';
+export const LOCAL_ARCHIVE_STORAGE_KEY = 'volleyball_local_archive_v1';
+export const API_KEY_STORAGE_KEY = 'volleyball_api_key_v1';
+export const TEAM_PRESETS_STORAGE_KEY = 'volleyball_team_presets_v1';
+export const CUSTOM_FORMATIONS_STORAGE_KEY = 'volleyball_custom_formations_v1';
+export const ACTIVE_MATCH_STORAGE_KEY = 'setpoint_active_match';
 
 // Optional VITE_API_BASE_URL for separate domain hosting; defaults to '' (relative /api/... via Vite proxy or Go static server)
 const API_BASE = ((import.meta as { env?: Record<string, string> }).env?.VITE_API_BASE_URL ?? '').replace(/\/+$/, '');
@@ -54,12 +58,12 @@ function buildHeaders(apiKey?: string, includeJson = false): Record<string, stri
 }
 
 /**
- * Strips frontend-only undo snapshots before uploading to keep payload compact.
+ * Strips frontend-only undo snapshots before uploading or archiving to keep payload compact.
  */
-function sanitizePayloadForUpload(payload: VolleyballMatchPayload): VolleyballMatchPayload {
+export function sanitizePayloadForStorage(payload: VolleyballMatchPayload): VolleyballMatchPayload {
   return {
     ...payload,
-    events: payload.events.map(({ scoreSnapshot: _snap, ...rest }) => rest)
+    events: payload.events.map(({ scoreSnapshot: _snap, undoSnapshot: _undo, ...rest }) => rest)
   };
 }
 
@@ -67,7 +71,7 @@ export async function uploadMatch(
   payload: VolleyballMatchPayload,
   apiKey?: string
 ): Promise<{ matchId: string; syncedEvents: number }> {
-  const cleanPayload = sanitizePayloadForUpload(payload);
+  const cleanPayload = sanitizePayloadForStorage(payload);
   let resp: Response;
   try {
     resp = await fetch(`${API_BASE}/api/volleyball/matches`, {
@@ -95,8 +99,9 @@ export async function uploadMatch(
   }
 
   const result = await resp.json();
-  // Remove from offline outbox if it was previously queued
+  // Remove from offline outbox if it was previously queued and mark local archive copy synced
   removeOfflineMatch(payload.matchId);
+  saveMatchToLocalArchive({ ...cleanPayload, syncState: 'synced' });
   return {
     matchId: result.matchId ?? payload.matchId,
     syncedEvents: result.syncedEvents ?? payload.events.length
@@ -157,11 +162,11 @@ export async function fetchSavedMatchById(
   return (await resp.json()) as VolleyballMatchPayload;
 }
 
-// --- OFFLINE OUTBOX (localStorage) ---
+// --- OFFLINE OUTBOX & LOCAL ARCHIVE (localStorage) ---
 
-export function getOfflineOutbox(): VolleyballMatchPayload[] {
+function readPayloadList(storageKey: string): VolleyballMatchPayload[] {
   try {
-    const raw = localStorage.getItem(OUTBOX_STORAGE_KEY);
+    const raw = localStorage.getItem(storageKey);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -170,27 +175,55 @@ export function getOfflineOutbox(): VolleyballMatchPayload[] {
   }
 }
 
-export function enqueueOfflineMatch(payload: VolleyballMatchPayload): void {
+function writePayloadList(storageKey: string, items: VolleyballMatchPayload[]): void {
   try {
-    const clean = sanitizePayloadForUpload(payload);
-    const current = getOfflineOutbox().filter((m) => m.matchId !== clean.matchId);
-    localStorage.setItem(OUTBOX_STORAGE_KEY, JSON.stringify([clean, ...current]));
+    if (items.length === 0) {
+      localStorage.removeItem(storageKey);
+    } else {
+      localStorage.setItem(storageKey, JSON.stringify(items));
+    }
   } catch {
     // Ignore storage quota errors
   }
 }
 
+export function getOfflineOutbox(): VolleyballMatchPayload[] {
+  return readPayloadList(OUTBOX_STORAGE_KEY);
+}
+
+export function enqueueOfflineMatch(payload: VolleyballMatchPayload): void {
+  const clean = sanitizePayloadForStorage({
+    ...payload,
+    savedLocallyAt: payload.savedLocallyAt ?? new Date().toISOString(),
+    syncState: 'local'
+  });
+  const current = getOfflineOutbox().filter((m) => m.matchId !== clean.matchId);
+  writePayloadList(OUTBOX_STORAGE_KEY, [clean, ...current]);
+  saveMatchToLocalArchive(clean);
+}
+
 export function removeOfflineMatch(matchId: string): void {
-  try {
-    const remaining = getOfflineOutbox().filter((m) => m.matchId !== matchId);
-    if (remaining.length === 0) {
-      localStorage.removeItem(OUTBOX_STORAGE_KEY);
-    } else {
-      localStorage.setItem(OUTBOX_STORAGE_KEY, JSON.stringify(remaining));
-    }
-  } catch {
-    // Ignore
-  }
+  const remaining = getOfflineOutbox().filter((m) => m.matchId !== matchId);
+  writePayloadList(OUTBOX_STORAGE_KEY, remaining);
+}
+
+export function getLocalArchive(): VolleyballMatchPayload[] {
+  return readPayloadList(LOCAL_ARCHIVE_STORAGE_KEY);
+}
+
+export function saveMatchToLocalArchive(payload: VolleyballMatchPayload): void {
+  const clean = sanitizePayloadForStorage({
+    ...payload,
+    savedLocallyAt: payload.savedLocallyAt ?? new Date().toISOString(),
+    syncState: payload.syncState ?? 'local'
+  });
+  const current = getLocalArchive().filter((m) => m.matchId !== clean.matchId);
+  writePayloadList(LOCAL_ARCHIVE_STORAGE_KEY, [clean, ...current]);
+}
+
+export function removeLocalArchiveMatch(matchId: string): void {
+  const remaining = getLocalArchive().filter((m) => m.matchId !== matchId);
+  writePayloadList(LOCAL_ARCHIVE_STORAGE_KEY, remaining);
 }
 
 export async function syncOfflineOutbox(apiKey?: string): Promise<{ synced: number; failed: number }> {
@@ -211,4 +244,72 @@ export async function syncOfflineOutbox(apiKey?: string): Promise<{ synced: numb
   }
 
   return { synced, failed };
+}
+
+// --- TEAM PRESETS (localStorage) ---
+
+export function getTeamPresets(): TeamPreset[] {
+  try {
+    const raw = localStorage.getItem(TEAM_PRESETS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveTeamPreset(preset: TeamPreset): TeamPreset[] {
+  const current = getTeamPresets().filter((p) => p.id !== preset.id);
+  const next = [preset, ...current];
+  try {
+    localStorage.setItem(TEAM_PRESETS_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore quota errors
+  }
+  return next;
+}
+
+export function deleteTeamPreset(presetId: string): TeamPreset[] {
+  const next = getTeamPresets().filter((p) => p.id !== presetId);
+  try {
+    if (next.length === 0) {
+      localStorage.removeItem(TEAM_PRESETS_STORAGE_KEY);
+    } else {
+      localStorage.setItem(TEAM_PRESETS_STORAGE_KEY, JSON.stringify(next));
+    }
+  } catch {
+    // Ignore
+  }
+  return next;
+}
+
+// --- STORAGE DIAGNOSTICS & CLEANUP ---
+
+export function getLocalStorageStats(): {
+  matchesCount: number;
+  outboxCount: number;
+  presetsCount: number;
+  hasApiKey: boolean;
+} {
+  return {
+    matchesCount: getLocalArchive().length,
+    outboxCount: getOfflineOutbox().length,
+    presetsCount: getTeamPresets().length,
+    hasApiKey: Boolean(getStoredApiKey().trim())
+  };
+}
+
+export function clearAllAppStorage(): void {
+  localStorage.removeItem(OUTBOX_STORAGE_KEY);
+  localStorage.removeItem(LOCAL_ARCHIVE_STORAGE_KEY);
+  localStorage.removeItem(API_KEY_STORAGE_KEY);
+  localStorage.removeItem(TEAM_PRESETS_STORAGE_KEY);
+  localStorage.removeItem(CUSTOM_FORMATIONS_STORAGE_KEY);
+  localStorage.removeItem(ACTIVE_MATCH_STORAGE_KEY);
+  // Clean up legacy keys if present
+  localStorage.removeItem('volleyball_offline_matches');
+  localStorage.removeItem('VOLLEYBALL_API_KEY');
+  localStorage.removeItem('volleyball_custom_formations');
+  localStorage.removeItem('activeMatch');
 }

@@ -1,8 +1,11 @@
 <script lang="ts">
-  import type { RotationPosition } from './types';
+  import type { PlayerSetup, RotationPosition, SystemType } from './types';
   import {
-    getPhasePlayers,
+    clearCustomFormationCoords,
+    getPhasePlayersForLineup,
     LIBERO_SWAP_BY_ROTATION,
+    loadCustomFormationCoords,
+    saveCustomFormationCoords,
     type PlayerKey,
     type TacticalPhase
   } from './formations';
@@ -14,6 +17,10 @@
     labels?: Partial<Record<RotationPosition, string>>;
     playerNames?: Partial<Record<RotationPosition, string>>;
     hasLibero?: boolean;
+    courtPlayers?: PlayerSetup[];
+    system?: SystemType;
+    selectedPosition?: RotationPosition | null;
+    onSelectPosition?: (pos: RotationPosition) => void;
   }
 
   let {
@@ -21,18 +28,45 @@
     phase = $bindable<TacticalPhase>('receive'),
     labels = {},
     playerNames = {},
-    hasLibero = true
+    hasLibero = true,
+    courtPlayers = [],
+    system = '5-1',
+    selectedPosition = null,
+    onSelectPosition
   }: Props = $props();
 
   type Mode = 'default' | 'custom';
   let mode = $state<Mode>('default');
+  let hasCustomOverride = $state(false);
 
-  // Reactive on-court players (always 6 active players: S, OH1, OH2, OPP, L, and either MB1 or MB2)
-  let players = $state<FormationPlayer[]>(getPhasePlayers(1, 'receive'));
+  function computeEffectivePlayers(rot: number, ph: TacticalPhase): FormationPlayer[] {
+    const base = getPhasePlayersForLineup({
+      courtPlayers,
+      rotation: rot,
+      phase: ph,
+      system,
+      hasLibero
+    });
+    const custom = loadCustomFormationCoords(system, rot, ph);
+    if (!custom) {
+      hasCustomOverride = false;
+      return base;
+    }
+    hasCustomOverride = true;
+    return base.map((p) => {
+      const saved = custom[String(p.pos)];
+      return saved ? { ...p, x: saved.x, y: saved.y } : p;
+    });
+  }
 
-  // Sync coordinates & automatic FIVB Libero <-> MB1/MB2 replacement whenever rotation or phase changes
+  let players = $state<FormationPlayer[]>(getPhasePlayersForLineup({ rotation: 1, phase: 'receive' }));
+
+  // Sync coordinates whenever rotation, phase, system, libero, or lineup changes, preserving saved custom edits
   $effect(() => {
-    players = getPhasePlayers(currentRotation, phase);
+    // Track dependencies explicitly
+    const _deps = [currentRotation, phase, system, hasLibero, courtPlayers];
+    void _deps;
+    players = computeEffectivePlayers(currentRotation, phase);
   });
 
   // Front row (Pos 4, 3, 2) and Back row (Pos 5, 6, 1) ordered left-to-right
@@ -55,26 +89,34 @@
 
   function setPhase(nextPhase: TacticalPhase) {
     phase = nextPhase;
-    players = getPhasePlayers(currentRotation, nextPhase);
+    players = computeEffectivePlayers(currentRotation, nextPhase);
   }
 
   function setMode(nextMode: Mode) {
     mode = nextMode;
     if (nextMode === 'default') {
-      players = getPhasePlayers(currentRotation, phase);
+      players = computeEffectivePlayers(currentRotation, phase);
     }
   }
 
   function resetPositions() {
-    players = getPhasePlayers(currentRotation, phase);
+    clearCustomFormationCoords(system, currentRotation, phase);
+    hasCustomOverride = false;
+    players = getPhasePlayersForLineup({
+      courtPlayers,
+      rotation: currentRotation,
+      phase,
+      system,
+      hasLibero
+    });
   }
 
-  // Pointer-event drag & drop for Custom ("Edit Positions") mode
+  // Pointer-event drag & drop for Custom ("Positionen anpassen") mode
   let courtEl: HTMLDivElement | undefined = $state();
   let draggingPos = $state<RotationPosition | null>(null);
 
   function clamp(v: number) {
-    return Math.min(100, Math.max(0, v));
+    return Math.min(96, Math.max(4, v));
   }
 
   function onPointerDown(e: PointerEvent, p: FormationPlayer) {
@@ -96,11 +138,22 @@
     if (el.hasPointerCapture(e.pointerId)) {
       el.releasePointerCapture(e.pointerId);
     }
+    if (draggingPos !== null) {
+      saveCustomFormationCoords(system, currentRotation, phase, players);
+      hasCustomOverride = true;
+    }
     draggingPos = null;
+  }
+
+  function handleTokenClick(pos: RotationPosition) {
+    if (mode === 'custom') return;
+    onSelectPosition?.(pos);
   }
 
   const ROLE_COLORS: Record<PlayerKey, string> = {
     S: '#d97706',
+    S1: '#d97706',
+    S2: '#ea580c',
     OH1: '#0284c7',
     OH2: '#0369a1',
     MB1: '#4f46e5',
@@ -118,7 +171,7 @@
   }
 </script>
 
-<section class="rf" aria-label="5-1 Taktische Formation (Annahme & Transition)">
+<section class="rf" aria-label={`${system} Taktische Formation (Annahme & Angriff)`}>
   <!-- FRONT & BACK ROW OVERVIEW -->
   <div class="rows-card" aria-label="Spieler in Vorderfeld und Hinterfeld">
     <div class="row-line">
@@ -126,15 +179,18 @@
       <div class="row-chips">
         {#each frontRowPlayers as p (p.pos)}
           {@const roleKey = effectiveRole(p)}
-          <span
+          <button
+            type="button"
             class="player-chip"
+            class:selected={selectedPosition === p.pos}
             style="--chip-color: {ROLE_COLORS[roleKey] ?? '#0284c7'}"
+            onclick={() => handleTokenClick(p.pos)}
             title={playerNames[p.pos] ?? labels[p.pos] ?? roleKey}
           >
             <span class="chip-dot"></span>
             <span class="chip-name">{playerNames[p.pos] ?? labels[p.pos] ?? roleKey}</span>
             <span class="chip-pos">P{p.pos}</span>
-          </span>
+          </button>
         {/each}
       </div>
     </div>
@@ -144,21 +200,24 @@
       <div class="row-chips">
         {#each backRowPlayers as p (p.pos)}
           {@const roleKey = effectiveRole(p)}
-          <span
+          <button
+            type="button"
             class="player-chip"
+            class:selected={selectedPosition === p.pos}
             style="--chip-color: {ROLE_COLORS[roleKey] ?? '#0284c7'}"
+            onclick={() => handleTokenClick(p.pos)}
             title={playerNames[p.pos] ?? labels[p.pos] ?? roleKey}
           >
             <span class="chip-dot"></span>
             <span class="chip-name">{playerNames[p.pos] ?? labels[p.pos] ?? roleKey}</span>
             <span class="chip-pos">P{p.pos}</span>
-          </span>
+          </button>
         {/each}
       </div>
     </div>
   </div>
 
-  <!-- PHASE SWITCHER: RECEIVE vs TRANSITION -->
+  <!-- PHASE SWITCHER: ANNAHME vs ANGRIFF -->
   <div class="phase-bar" role="tablist" aria-label="Taktische Phase">
     <button
       type="button"
@@ -168,7 +227,7 @@
       class:active={phase === 'receive'}
       onclick={() => setPhase('receive')}
     >
-      Annahme (Receive)
+      Annahme ({system})
     </button>
     <button
       type="button"
@@ -182,7 +241,7 @@
     </button>
   </div>
 
-  <!-- MODE SWITCHER: DEFAULT FORMATIONS vs EDIT POSITIONS -->
+  <!-- MODE SWITCHER: STANDARD-RIEGEL vs POSITIONEN ANPASSEN -->
   <div class="bar">
     <div class="seg" role="tablist" aria-label="Positions-Modus">
       <button
@@ -192,7 +251,7 @@
         class:active={mode === 'default'}
         onclick={() => setMode('default')}
       >
-        Default Formations
+        {hasCustomOverride ? 'Gespeicherter Riegel' : 'Standard-Riegel'}
       </button>
       <button
         type="button"
@@ -201,18 +260,24 @@
         class:active={mode === 'custom'}
         onclick={() => setMode('custom')}
       >
-        Edit Positions
+        Positionen anpassen
       </button>
     </div>
-    {#if mode === 'custom'}
-      <button type="button" class="reset" onclick={resetPositions}>Reset</button>
+    {#if mode === 'custom' || hasCustomOverride}
+      <button type="button" class="reset" onclick={resetPositions} title="Auf Standard-Positionen zurücksetzen">
+        Zurücksetzen
+      </button>
     {/if}
   </div>
+
+  {#if mode === 'default' && onSelectPosition}
+    <p class="rf-hint">Tipp: Spieler-Kreis antippen, um direkt für das Scouting auszuwählen.</p>
+  {/if}
 
   <!-- FIVB LEGALITY STATUS: only shown when an illegal positional fault occurs -->
   {#if phase === 'receive' && !legal}
     <div class="badge bad" role="alert" aria-live="polite">
-      Illegal Positional Fault
+      Aufstellungsfehler (FIVB Überlappung)
     </div>
     <ul class="errs">
       {#each errors as err}
@@ -223,23 +288,32 @@
 
   <!-- INTERACTIVE COURT WITH SMOOTH CSS TRANSITIONS -->
   <div class="court" bind:this={courtEl} class:custom={mode === 'custom'}>
-    <div class="net">NETZ </div>
+    <div class="net">NETZ</div>
     <div class="attack-line">
       <span class="attack-label">3m-Linie</span>
     </div>
 
-    {#each players as p (p.label ?? p.pos)}
+    {#each players as p (p.pos)}
       {@const roleKey = effectiveRole(p)}
       <div
         class="token"
         class:dragging={draggingPos === p.pos}
         class:fault={phase === 'receive' && faultyPositions.has(p.pos)}
+        class:selected={selectedPosition === p.pos}
         class:locked={mode === 'default'}
         style="left: {p.x}%; top: {p.y}%; --role-bg: {ROLE_COLORS[roleKey] ?? '#0284c7'};"
         role="button"
         tabindex="0"
         title={playerNames[p.pos] ? `${playerNames[p.pos]} (Pos ${p.pos})` : undefined}
         aria-label={`${playerNames[p.pos] ?? roleKey} (Pos ${p.pos}), X ${Math.round(p.x)}%, Y ${Math.round(p.y)}%`}
+        aria-pressed={selectedPosition === p.pos}
+        onclick={() => handleTokenClick(p.pos)}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            handleTokenClick(p.pos);
+          }
+        }}
         onpointerdown={(e) => onPointerDown(e, p)}
         onpointermove={(e) => onPointerMove(e, p)}
         onpointerup={onPointerUp}
@@ -334,6 +408,14 @@
     padding: 4px 6px;
     font-size: 0.76rem;
     box-sizing: border-box;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+
+  .player-chip.selected {
+    border-color: #d97706;
+    background: #fffbeb;
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.35);
   }
 
   .chip-dot {
@@ -372,7 +454,7 @@
   }
 
   .phase-btn {
-    min-height: 48px;
+    min-height: 44px;
     padding: 0 12px;
     font-size: 0.85rem;
     font-weight: 800;
@@ -409,10 +491,10 @@
 
   .seg button,
   .reset {
-    min-height: 48px;
-    padding: 0 14px;
+    min-height: 42px;
+    padding: 0 12px;
     font-weight: 800;
-    font-size: 0.82rem;
+    font-size: 0.8rem;
     border: none;
     background: #ffffff;
     color: #0f172a;
@@ -433,6 +515,15 @@
   .reset {
     border: 2px solid #0f172a;
     border-radius: 10px;
+    white-space: nowrap;
+  }
+
+  .rf-hint {
+    margin: -2px 0 0;
+    font-size: 0.72rem;
+    color: #64748b;
+    font-weight: 600;
+    text-align: center;
   }
 
   .badge {
@@ -525,7 +616,6 @@
     line-height: 1.05;
     font-weight: 900;
     box-shadow: 0 3px 6px rgba(15, 23, 42, 0.3);
-    /* Smooth CSS transition when switching between Receive and Transition phases */
     transition:
       left 0.55s cubic-bezier(0.22, 1, 0.36, 1),
       top 0.55s cubic-bezier(0.22, 1, 0.36, 1),
@@ -534,10 +624,11 @@
     touch-action: none;
     outline: none;
     z-index: 3;
+    cursor: pointer;
   }
 
   .role-tag {
-    font-size: 0.8rem;
+    font-size: 0.78rem;
     font-weight: 900;
   }
 
@@ -551,7 +642,6 @@
     cursor: grab;
   }
 
-  /* Hover: only box-shadow, no border-width or dimension changes (prevents layout shift) */
   .token:hover {
     box-shadow:
       0 0 0 3px rgba(245, 158, 11, 0.65),
@@ -563,7 +653,14 @@
     outline-offset: 2px;
   }
 
-  /* Disable left/top transition while actively dragging so pointer tracking is immediate */
+  .token.selected {
+    border: 3px solid #f59e0b;
+    box-shadow:
+      0 0 0 4px rgba(245, 158, 11, 0.5),
+      0 6px 12px rgba(15, 23, 42, 0.35);
+    z-index: 8;
+  }
+
   .token.dragging {
     cursor: grabbing;
     transition: box-shadow 0.1s ease;

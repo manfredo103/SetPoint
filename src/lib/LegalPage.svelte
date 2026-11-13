@@ -1,4 +1,14 @@
 <script lang="ts">
+  import {
+    OUTBOX_STORAGE_KEY,
+    LOCAL_ARCHIVE_STORAGE_KEY,
+    API_KEY_STORAGE_KEY,
+    TEAM_PRESETS_STORAGE_KEY,
+    CUSTOM_FORMATIONS_STORAGE_KEY,
+    ACTIVE_MATCH_STORAGE_KEY,
+    getLocalStorageStats,
+    clearAllAppStorage
+  } from './api';
   import type { LegalTab } from './types';
 
   let {
@@ -30,8 +40,15 @@
   }
 
   // Cookie & Storage Manager helper
-  let cacheStatus = $state<{ matchesCount: number; hasApiKey: boolean }>({
+  let cacheStatus = $state<{
+    matchesCount: number;
+    outboxCount: number;
+    presetsCount: number;
+    hasApiKey: boolean;
+  }>({
     matchesCount: 0,
+    outboxCount: 0,
+    presetsCount: 0,
     hasApiKey: false
   });
   let cacheClearFeedback = $state<string | null>(null);
@@ -39,15 +56,9 @@
   function readStorageStatus() {
     if (typeof window === 'undefined') return;
     try {
-      const raw = localStorage.getItem('volleyball_offline_matches');
-      const matches = raw ? JSON.parse(raw) : [];
-      const key = localStorage.getItem('VOLLEYBALL_API_KEY');
-      cacheStatus = {
-        matchesCount: Array.isArray(matches) ? matches.length : 0,
-        hasApiKey: Boolean(key && key.trim())
-      };
+      cacheStatus = getLocalStorageStats();
     } catch {
-      cacheStatus = { matchesCount: 0, hasApiKey: false };
+      cacheStatus = { matchesCount: 0, outboxCount: 0, presetsCount: 0, hasApiKey: false };
     }
   }
 
@@ -56,21 +67,17 @@
   });
 
   function handleClearCache() {
-    if (!confirm('Möchtest du den lokalen App-Speicher (Offline-Puffer und gespeicherten Team-PIN) wirklich leeren?')) {
+    if (!confirm('Möchtest du den lokalen App-Speicher (lokales Archiv, Offline-Puffer, Kader-Vorlagen und gespeicherten Team-PIN) wirklich leeren?')) {
       return;
     }
     try {
-      localStorage.removeItem('volleyball_offline_matches');
-      localStorage.removeItem('VOLLEYBALL_API_KEY');
-      localStorage.removeItem('volleyball_custom_formations');
-      localStorage.removeItem('setpoint_active_match');
-      localStorage.removeItem('activeMatch');
+      clearAllAppStorage();
       readStorageStatus();
       cacheClearFeedback = 'Lokaler App-Speicher wurde erfolgreich geleert.';
       setTimeout(() => {
         cacheClearFeedback = null;
       }, 4000);
-    } catch (e) {
+    } catch {
       cacheClearFeedback = 'Fehler beim Leeren des Speichers.';
     }
   }
@@ -306,25 +313,37 @@
               </thead>
               <tbody>
                 <tr>
-                  <td><code>volleyball_offline_matches</code></td>
+                  <td><code>{OUTBOX_STORAGE_KEY}</code></td>
                   <td>Technisch notwendig (LocalStorage)</td>
-                  <td>Sichert beendete Spiele lokal, wenn keine Verbindung zum Go-Backend besteht.</td>
-                  <td>Bis zum erfolgreichen Upload oder manuellem Löschen</td>
+                  <td>Sichert beendete Spiele für den späteren Upload zum Go-Backend.</td>
+                  <td>Bis zum Upload oder manuellem Löschen</td>
                 </tr>
                 <tr>
-                  <td><code>VOLLEYBALL_API_KEY</code></td>
+                  <td><code>{LOCAL_ARCHIVE_STORAGE_KEY}</code></td>
+                  <td>Funktional (LocalStorage)</td>
+                  <td>Lokales Geräte-Archiv abgeschlossener Spiele (auch ohne Server).</td>
+                  <td>Dauerhaft auf diesem Gerät</td>
+                </tr>
+                <tr>
+                  <td><code>{API_KEY_STORAGE_KEY}</code></td>
                   <td>Funktional (LocalStorage)</td>
                   <td>Merkt sich deinen Team-PIN / API-Key für autorisierte Uploads zur InfluxDB.</td>
                   <td>Dauerhaft auf diesem Gerät</td>
                 </tr>
                 <tr>
-                  <td><code>volleyball_custom_formations</code></td>
+                  <td><code>{TEAM_PRESETS_STORAGE_KEY}</code></td>
+                  <td>Funktional (LocalStorage)</td>
+                  <td>Speichert wiederverwendbare Kader-Vorlagen für das Spiel-Setup.</td>
+                  <td>Dauerhaft auf diesem Gerät</td>
+                </tr>
+                <tr>
+                  <td><code>{CUSTOM_FORMATIONS_STORAGE_KEY}</code></td>
                   <td>Funktional (LocalStorage)</td>
                   <td>Speichert manuell justierte Spielerpositionen für die Taktiktafel.</td>
                   <td>Dauerhaft auf diesem Gerät</td>
                 </tr>
                 <tr>
-                  <td><code>setpoint_active_match</code></td>
+                  <td><code>{ACTIVE_MATCH_STORAGE_KEY}</code></td>
                   <td>Technisch notwendig (LocalStorage)</td>
                   <td>Sichert den aktuellen Spielstand, Sätze, Rotationen und Events bei versehentlichem Neuladen.</td>
                   <td>Bis zum Spielabschluss („Neues Spiel“)</td>
@@ -338,8 +357,12 @@
           <h3>Lokaler Speicherstatus auf diesem Gerät</h3>
           <div class="cache-status-card">
             <div class="cache-stat-item">
-              <span class="cs-label">Lokal gepufferte Spiele:</span>
+              <span class="cs-label">Lokal archivierte Spiele (inkl. {cacheStatus.outboxCount} Sync-ausstehend):</span>
               <span class="cs-val">{cacheStatus.matchesCount} Spiel(e)</span>
+            </div>
+            <div class="cache-stat-item">
+              <span class="cs-label">Gespeicherte Kader-Vorlagen:</span>
+              <span class="cs-val">{cacheStatus.presetsCount} Vorlage(n)</span>
             </div>
             <div class="cache-stat-item">
               <span class="cs-label">Team-PIN hinterlegt:</span>
